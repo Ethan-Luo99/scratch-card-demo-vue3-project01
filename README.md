@@ -1,6 +1,6 @@
 # 刮刮卡演示（Vue 3 + Vite）
 
-基于 Vue 3 组合式 API + Canvas 实现的刮刮卡演示页面，无任何额外运行时依赖。
+基于 Vue 3 组合式 API + Canvas 的刮刮卡组件，无任何额外运行时依赖。
 
 ## 运行
 
@@ -11,33 +11,109 @@ npm run dev
 
 ## 功能
 
-- 鼠标拖动 / 手指触摸刮开灰色涂层，底层为写死的中奖内容（88 元现金红包）
-- 实时显示刮开面积百分比，达到阈值（默认 40%）后涂层整体淡出并触发完成回调
-- 支持重置后再次刮开
-- 响应式模式：卡片宽度撑满父容器、按宽高比推导高度，容器尺寸变化自动跟随
-- 无损 resize：容器尺寸变化 / 浏览器缩放 / 跨屏拖动（DPR 变化）时刮痕与
-  进度完整保留，刮痕等比缩放且边缘清晰
-- 运行时换肤：coverColor / coverText / threshold 修改立即生效，不抹掉刮痕
-- 演示页内置运营面板，可实时调整文案、底色、阈值与响应式开关
-- 通用组件 `src/components/ScratchCard.vue`：
-  - props：`width`、`height`、`responsive`、`aspectRatio`、`threshold`、
-    `brushSize`、`coverColor`、`coverText`、`fadeDuration`
-  - 默认插槽：底层中奖内容
-  - 事件：`progress`（0-100）、`finish`
-  - 暴露方法：`reset()`
+- 鼠标 / 手指刮开涂层，实时显示刮开面积百分比，达阈值后涂层淡出并触发 `finish`
+- **撤销 / 重做**：笔画粒度的 `undo()` / `redo()`，`canUndo` / `canRedo` 响应式状态；
+  完成（淡出）后禁用，`reset` 后清空；撤销深度由 `maxHistory`（默认 200）封顶
+- **分层缓存**：笔迹超过 `rasterizeAfter`（默认 500）笔后自动固化为遮罩位图，
+  resize / 换肤只重放「固化位图 + 未固化增量」，重放耗时与总笔画数无关
+- **存档恢复**：`save()` 返回可序列化快照，`restore(snapshot)` 无损恢复
+  （笔迹 + 固化遮罩 + 进度 + 完成态 + redo 栈），恢复后交互 / 换肤 / resize /
+  撤销重做全部继续可用
+- 响应式尺寸、无损 resize / DPR 切换、运行时换肤（v2 能力全部保留）
+
+## 组件接口（`src/components/ScratchCard.vue`）
+
+- Props（v2 全部保留，新增两项）：
+  - v2：`width`、`height`、`responsive`、`aspectRatio`、`threshold`、`brushSize`、
+    `coverColor`、`coverText`、`fadeDuration`
+  - 新增：`maxHistory`（撤销栈深度，默认 `200`）、`rasterizeAfter`（固化阈值，默认 `500`）
+- 默认插槽：底层中奖内容
+- 事件：`progress`（0-100）、`finish`
+- 暴露方法 / 状态：
+  - `reset()`（v2）
+  - `undo()` / `redo()`、`canUndo` / `canRedo`（ref，经模板 ref 自动解包）
+  - `save()` → `{ format, v, d }`（`JSON.stringify` 可直接存 localStorage）
+  - `restore(snapshot)` → `{ finished, progress }`
+  - `__fillStrokes(n)` / `__benchReplay()` / `__verifyBake()` / `__stats()`：
+    下划线前缀的**调试辅助**，仅供手工压测，非正式业务接口
 
 ## 实现说明
 
-- 高清屏：canvas backing store 按 `devicePixelRatio` 放大并做坐标缩放，
-  2x/3x 设备上刮痕清晰、位置无偏移。
-- 触控：Pointer Events 按 `pointerId` 维护各自轨迹，支持多指同时刮；
-  `touch-action: none` 禁止页面滚动与缩放。
-- 性能：不做每次 move 的全图 `getImageData`，而是降采样到约 12px 网格的
-  离屏小画布（几百个像素），配合约 160ms 节流统计透明点占比；pointerup 立即补测。
-- 快速甩动：相邻采样点用粗线段（round cap/join）连接，并消费
-  `getCoalescedEvents()` 补点，笔迹连续不漏刮。
-- 标签页切换：`visibilitychange` 时清理悬挂的指针状态，切回后正常使用。
-- 无损重建：刮痕同时以归一化坐标记录为矢量笔画，尺寸 / DPR 变化时
-  「重绘涂层 + 等比重放笔画」，任意次重建都不降质，且零 getImageData。
-- 尺寸监听：ResizeObserver 监听容器，matchMedia(resolution) 监听 DPR，
-  统一用 rAF 合并重建（每帧最多一次），刮擦进行中画布始终跟手。
+### 矢量笔迹 + 三层表示
+
+- 刮痕以归一化坐标（`x/宽`、`y/高`、`笔宽/宽`）记录，resize / DPR 变化时等比重放
+- 任意时刻三个事实来源：
+  - `strokes`：撤销窗口内的矢量笔（窗口相对数组），`[0,k)` 为窗口内已固化段，
+    `[k,n)` 为未固化增量；正在刮、尚未抬手的活动笔只在 `activePointers` 中，
+    不进撤销栈（多指刮擦中 undo 不会误伤在画的手指）
+  - `bakeCanvas`：已固化遮罩（透明底 + 黑色划痕，alpha 即刮除强度），恒为
+    永久层超集；重建涂层时 `destination-out` 抠除，与涂层颜色/文案完全解耦
+  - `frozenCanvas`：被 `maxHistory` 挤出撤销窗口的「永久段」遮罩，同时释放
+    对应矢量点集内存——长会话常驻内存与总笔画数无关
+- 撤销跨固化边界时，位图无法「减」单笔（alpha 叠加不可逆），改为
+  **从 frozen + 仍固化矢量局部重固化**；`__verifyBake()` 逐像素断言其与
+  「同一批笔全量矢量重绘」完全一致（实测 diffPixels=0）
+
+### 遮罩「拍平」（性能关键）
+
+canvas 的 `drawImage(源画布)` 在软件光栅化下可能按源画布累积的 2D 显示列表
+重新光栅化。只往同一画布增量画 5000 笔后，一次 drawImage 实测可达 ~59ms。
+因此每累计 256 次矢量绘制就把遮罩画进一张全新空画布（栅格化一次、丢弃显示
+列表），此后它是纯像素图，被 drawImage 时成本恒定（实测 50 笔与 5000 笔
+重放均约 0.01–0.03ms）。
+
+### 快照格式（手写紧凑二进制，2MB 内）
+
+- **不用整图 PNG + base64**：设备分辨率位图体积随 DPR/笔画膨胀、2MB 不可控，
+  且无法支持恢复后的矢量级跨边界 undo
+- 笔迹：归一化坐标 **16bit 量化 + 相邻点差分 + zigzag + LEB128 varint**
+  （量化误差在 1000px 卡上 < 0.016px，视觉无损）
+- 固化遮罩：只存一张固定归一化网格（360×按宽高比）的 **alpha + PackBits RLE**；
+  固化层在恢复时由「永久层 + 窗口矢量笔」现场重固化，不额外占位图
+- 分组：已确认笔 / 存档时活动笔（恢复后提升为已确认）/ redo 栈 / 完成标记 / 进度
+- 整体 base64 封装为 JSON 对象；`save()` 对序列化结果做 **2MB 硬校验**，超限抛错
+- 实测：650 笔（含 150 笔固化 + redo 栈）约 32KB；5000 笔（4800 笔永久化）
+  约 12KB，远低于上限
+
+### 像素读取约束
+
+唯一业务像素读取是约 12px 网格的降采样小画布（进度统计）；快照读取的是固定
+360 网格遮罩，**任何路径都不按设备分辨率全图 `getImageData`**。
+
+## 性能验收（硬指标实测方法）
+
+1. `npm run dev` 后打开页面，点「实测重放耗时」按钮（或控制台
+   `cardRef.value.__benchReplay()`）
+2. 内部用合成笔迹分别填充 **50 笔（纯矢量）** 与 **5000 笔（已固化+拍平）**，
+   各连跑 30 次 `repaint()` 取均值，结果打印到 console：
+   `[ScratchCard] perf replay: 50 strokes = 0.030ms, 5000 strokes (baked) = 0.010ms`
+3. 5000 笔不慢于 50 笔（二者同量级，都在亚毫秒）；也可灌入 5000 笔后直接
+   拖动窗口边缘 resize，体感无掉帧、刮痕与进度完整保留
+
+> 也可把组件内 `DEBUG_PERF` 改为 `true`，挂载后自动跑一次基准并打印。
+
+## 边界场景手工复验清单
+
+演示页提供撤销/重做/保存/恢复按钮、`maxHistory` 与 `rasterizeAfter` 滑杆、
+「灌入 600/5000 笔」压测按钮，以下场景均可手工复现：
+
+1. **固化瞬间发生 undo**：固化在 `pointerup` 提交时**同步**完成
+   （清 redo → 固化 → 永久化），JS 单线程下该序列之间没有可插入事件的间隙；
+   undo 永远只看到提交前/后的一致状态。复验：灌入 600 笔（跨过 500 阈值），
+   连续撤销，跨边界时自动局部重固化，刮痕逐笔恢复且与全量重放逐像素等价
+   （`__verifyBake()` 返回 `diffPixels:0`）。
+2. **resize 过程中连续 undo**：灌入 560 笔，拖动窗口边缘（或 DevTools 切设备
+   尺寸）后立刻连续点「撤销」；rAF 重建是幂等的全量重绘，执行时读到的就是
+   撤销后的最新状态，刮痕不串、不丢、不重复，redo 可用。
+3. **淡出期间 restore**：调低阈值刮到完成（涂层淡出中），点「恢复快照」；
+   淡出与隐藏定时器被取消，涂层无过渡地立即回到存档状态（opacity 恢复 1），
+   进度/完成态以快照为准，之后可继续刮与撤销。
+4. **换肤后 redo 栈语义——明确保留**：换肤只改涂层外观，与笔迹正交（遮罩不含
+   涂层颜色）；undo 后改变底色/文案，「重做」仍可逐像素正确重放到新涂层。
+   只有「提交一笔新笔迹」才清空 redo（经典编辑器分支语义）。理由已写在
+   `coverColor/coverText` 的 watch 注释中。
+5. **save 发生在 rAF 重建挂起期间**：灌入 500+ 笔后立即改窗口尺寸并在同一刻
+   点「保存快照」；快照读的是「矢量 + 遮罩」事实来源而非显示画布，重建挂起不
+   影响内容，之后重置再恢复，进度与刮痕一致。
+6. 其他：多指两指同刮时撤销只撤已抬手的笔；`pointercancel` / 切后台丢弃未完成
+   半笔；完成态快照恢复后涂层隐藏且 undo 禁用，`reset` 可回到全新卡。

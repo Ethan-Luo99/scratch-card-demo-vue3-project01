@@ -2,20 +2,27 @@
 import { ref } from 'vue'
 import ScratchCard from './components/ScratchCard.vue'
 
-// 刮开面积百分比（0-100），由 ScratchCard 的 progress 事件实时更新
 const progress = ref(0)
-// 是否已刮达阈值并触发完成回调
 const finished = ref(false)
 const cardRef = ref(null)
 
-/* ---------- 运营面板：运行时换肤 / 调阈值 / 切换响应式 ---------- */
+/* ---------- 运营面板配置 ---------- */
 
 const coverText = ref('刮开查看奖品')
 const coverColor = ref('#b8bcc6')
 const threshold = ref(40)
 const responsive = ref(true)
+const maxHistory = ref(200)
+const rasterizeAfter = ref(500)
 
 const colorPresets = ['#b8bcc6', '#2563eb', '#c2410c', '#0f766e', '#7c3aed']
+
+/* ---------- 存档 ---------- */
+
+const SNAPSHOT_KEY = 'scratch-card-snapshot'
+const snapshotSize = ref(0)
+const snapshotSaved = ref(false)
+const restoreTip = ref('')
 
 function handleProgress(value) {
   progress.value = value
@@ -29,6 +36,55 @@ function handleReset() {
   cardRef.value?.reset()
   progress.value = 0
   finished.value = false
+  restoreTip.value = ''
+}
+
+/* ---------- 撤销 / 重做 ---------- */
+
+function handleUndo() {
+  cardRef.value?.undo()
+}
+
+function handleRedo() {
+  cardRef.value?.redo()
+}
+
+/* ---------- 存档 / 恢复 ---------- */
+
+function handleSave() {
+  const snapshot = cardRef.value.save()
+  const serialized = JSON.stringify(snapshot)
+  snapshotSize.value = serialized.length
+  snapshotSaved.value = true
+  localStorage.setItem(SNAPSHOT_KEY, serialized)
+  restoreTip.value = `已存档（${(serialized.length / 1024).toFixed(1)} KB），可刷新页面后恢复`
+}
+
+function handleRestore() {
+  const raw = localStorage.getItem(SNAPSHOT_KEY)
+  if (!raw) {
+    restoreTip.value = '本地没有存档，请先「保存快照」'
+    return
+  }
+  const result = cardRef.value?.restore(JSON.parse(raw))
+  if (result) {
+    finished.value = !!result.finished
+    progress.value = result.progress
+  }
+  restoreTip.value = '已从本地快照恢复'
+}
+
+/* ---------- 压测：合成 N 笔笔迹（验证固化 / 永久化 / 跨边界 undo） ---------- */
+
+function fillStrokes(count) {
+  cardRef.value?.__fillStrokes(count)
+}
+
+function runPerfBench() {
+  const result = cardRef.value?.__benchReplay()
+  if (result) {
+    restoreTip.value = `重放耗时 50笔=${result.t50.toFixed(2)}ms / 5000笔=${result.t5000.toFixed(2)}ms（详见控制台）`
+  }
 }
 </script>
 
@@ -36,11 +92,10 @@ function handleReset() {
   <main class="page">
     <h1 class="page__title">刮刮乐</h1>
     <p class="page__hint">
-      按住鼠标或手指拖动刮开涂层；拖动窗口边缘、缩放浏览器或切换下方开关，
-      刮痕与进度都会保留
+      按住鼠标或手指拖动刮开涂层；支持撤销 / 重做、存档恢复，
+      拖动窗口边缘、缩放浏览器或切换下方开关，刮痕与进度都会保留
     </p>
 
-    <!-- 卡片容器：宽度 min(92vw, 520px)，响应式模式下卡片撑满并自动跟随 -->
     <div class="stage">
       <ScratchCard
         ref="cardRef"
@@ -52,10 +107,11 @@ function handleReset() {
         :brush-size="30"
         :cover-color="coverColor"
         :cover-text="coverText"
+        :max-history="maxHistory"
+        :rasterize-after="rasterizeAfter"
         @progress="handleProgress"
         @finish="handleFinish"
       >
-        <!-- 底层中奖内容由默认插槽传入，可任意自定义 -->
         <div class="prize">
           <span class="prize__label">恭喜获得</span>
           <strong class="prize__value">88 元</strong>
@@ -69,33 +125,35 @@ function handleReset() {
       <template v-if="finished"> · 恭喜中奖 🎉</template>
     </p>
 
-    <button class="reset-btn" type="button" @click="handleReset">
-      重置
-    </button>
+    <div class="actions">
+      <button type="button" :disabled="!cardRef?.canUndo" @click="handleUndo">
+        撤销
+      </button>
+      <button type="button" :disabled="!cardRef?.canRedo" @click="handleRedo">
+        重做
+      </button>
+      <button type="button" class="primary" @click="handleSave">保存快照</button>
+      <button type="button" @click="handleRestore">恢复快照</button>
+      <button type="button" @click="handleReset">重置</button>
+    </div>
 
-    <!-- 运营面板：所有修改运行时立即生效，不影响已有刮痕 -->
+    <p v-if="restoreTip" class="tip">{{ restoreTip }}</p>
+    <p v-if="snapshotSaved" class="tip tip--muted">
+      最近快照体积：{{ (snapshotSize / 1024).toFixed(2) }} KB（上限 2048 KB）
+    </p>
+
     <section class="panel">
       <h2 class="panel__title">运营面板</h2>
 
       <label class="field">
         <span class="field__label">涂层文案</span>
-        <input
-          v-model="coverText"
-          class="field__input"
-          type="text"
-          placeholder="留空则不显示文案"
-        />
+        <input v-model="coverText" class="field__input" type="text" placeholder="留空则不显示文案" />
       </label>
 
       <div class="field">
         <span class="field__label">涂层底色</span>
         <div class="field__colors">
-          <input
-            v-model="coverColor"
-            class="field__color"
-            type="color"
-            title="自定义颜色"
-          />
+          <input v-model="coverColor" class="field__color" type="color" title="自定义颜色" />
           <button
             v-for="color in colorPresets"
             :key="color"
@@ -111,13 +169,17 @@ function handleReset() {
 
       <label class="field">
         <span class="field__label">完成阈值：{{ threshold }}%</span>
-        <input
-          v-model.number="threshold"
-          class="field__range"
-          type="range"
-          min="1"
-          max="100"
-        />
+        <input v-model.number="threshold" class="field__range" type="range" min="1" max="100" />
+      </label>
+
+      <label class="field">
+        <span class="field__label">撤销栈上限 maxHistory：{{ maxHistory }}</span>
+        <input v-model.number="maxHistory" class="field__range" type="range" min="1" max="1000" />
+      </label>
+
+      <label class="field">
+        <span class="field__label">固化阈值 rasterizeAfter：{{ rasterizeAfter }}</span>
+        <input v-model.number="rasterizeAfter" class="field__range" type="range" min="1" max="2000" />
       </label>
 
       <label class="field field--switch">
@@ -127,6 +189,15 @@ function handleReset() {
           {{ responsive ? '宽度撑满容器，高宽比 16:9' : '固定 320 × 190' }}
         </span>
       </label>
+
+      <div class="field field--full">
+        <span class="field__label">压测（合成笔迹，验证固化 / 永久化 / 跨边界 undo）</span>
+        <div class="field__actions">
+          <button type="button" @click="fillStrokes(600)">灌入 600 笔</button>
+          <button type="button" @click="fillStrokes(5000)">灌入 5000 笔</button>
+          <button type="button" @click="runPerfBench">实测重放耗时</button>
+        </div>
+      </div>
     </section>
   </main>
 </template>
@@ -138,7 +209,7 @@ function handleReset() {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 18px;
+  gap: 14px;
   padding: 24px;
   box-sizing: border-box;
 }
@@ -153,22 +224,19 @@ function handleReset() {
 
 .page__hint {
   margin: 0 0 6px;
-  max-width: 520px;
+  max-width: 560px;
   font-size: 14px;
   line-height: 1.6;
   text-align: center;
   color: #8a909c;
 }
 
-/* 卡片容器：宽度 = min(92vw, 520px) */
 .stage {
   width: min(92vw, 520px);
   display: flex;
   justify-content: center;
 }
 
-/* 卡片自身内联样式决定宽度（响应式 100% / 固定 320px），
-   这里只兜底不超出容器，固定尺寸时由 stage 居中 */
 .stage__card {
   max-width: 100%;
 }
@@ -202,7 +270,7 @@ function handleReset() {
 }
 
 .progress {
-  margin: 6px 0 0;
+  margin: 4px 0 0;
   font-size: 15px;
   font-variant-numeric: tabular-nums;
   color: #4b5563;
@@ -213,33 +281,63 @@ function handleReset() {
   font-weight: 600;
 }
 
-.reset-btn {
-  padding: 9px 34px;
-  font-size: 15px;
-  color: #fff;
-  background: #2563eb;
-  border: none;
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+}
+
+.actions button {
+  padding: 8px 18px;
+  font-size: 14px;
+  color: #1f2937;
+  background: #fff;
+  border: 1px solid #d1d5db;
   border-radius: 999px;
   cursor: pointer;
-  transition: background-color 0.2s, transform 0.1s;
+  transition: background-color 0.15s, transform 0.1s;
 }
 
-.reset-btn:hover {
-  background: #1d4ed8;
+.actions button:hover:not(:disabled) {
+  background: #f3f4f6;
 }
 
-.reset-btn:active {
+.actions button:active:not(:disabled) {
   transform: scale(0.96);
 }
 
-/* ---------- 运营面板 ---------- */
+.actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.actions button.primary {
+  color: #fff;
+  background: #2563eb;
+  border-color: #2563eb;
+}
+
+.actions button.primary:hover {
+  background: #1d4ed8;
+}
+
+.tip {
+  margin: 0;
+  font-size: 13px;
+  color: #2563eb;
+}
+
+.tip--muted {
+  color: #9ca3af;
+}
 
 .panel {
   width: min(92vw, 520px);
-  margin-top: 6px;
+  margin-top: 4px;
   padding: 18px 20px;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 14px 20px;
   background: #fff;
   border: 1px solid #e5e7eb;
@@ -262,6 +360,10 @@ function handleReset() {
   gap: 8px;
   font-size: 14px;
   color: #374151;
+}
+
+.field--full {
+  grid-column: 1 / -1;
 }
 
 .field__label {
@@ -328,6 +430,26 @@ function handleReset() {
 
 .field__desc {
   font-size: 13px;
-  color: #8a909c;
+  color: #6b7280;
+}
+
+.field__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.field__actions button {
+  padding: 6px 14px;
+  font-size: 13px;
+  color: #1f2937;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.field__actions button:hover {
+  background: #f3f4f6;
 }
 </style>
