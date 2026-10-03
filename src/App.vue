@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import ScratchCard from './components/ScratchCard.vue'
 
 // 刮开面积百分比（0-100），由 ScratchCard 的 progress 事件实时更新
@@ -16,6 +16,50 @@ const threshold = ref(40)
 const responsive = ref(true)
 
 const colorPresets = ['#b8bcc6', '#2563eb', '#c2410c', '#0f766e', '#7c3aed']
+
+// 撤销/重做可用性：组件 expose 的 ref 经 proxyRefs 解包，直接读布尔值
+const canUndo = computed(() => cardRef.value?.canUndo ?? false)
+const canRedo = computed(() => cardRef.value?.canRedo ?? false)
+
+// 演示把历史上限开大（默认 200），让 5000 笔压测时全部笔迹保持可撤销，
+// 从而真正走到「固化层」路径（rasterizeAfter=500 起固化）
+const maxHistory = ref(5000)
+
+/* ---------- 存档 / 恢复 ---------- */
+
+let snapshot = null
+const snapshotSize = ref(0)
+const snapshotError = ref('')
+const hasSnapshot = ref(false)
+
+function handleSave() {
+  snapshotError.value = ''
+  try {
+    snapshot = cardRef.value?.save() ?? null
+    snapshotSize.value = snapshot ? snapshot.length : 0
+    hasSnapshot.value = !!snapshot
+  } catch (err) {
+    snapshotError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+function handleRestore() {
+  if (!snapshot) return
+  snapshotError.value = ''
+  try {
+    // restore 若恢复为完成态会同步 emit('finish') 重新置位，故先复位
+    finished.value = false
+    cardRef.value?.restore(snapshot)
+  } catch (err) {
+    snapshotError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+/* ---------- 调试：压测注入 ---------- */
+
+function seed(count) {
+  cardRef.value?.__debug.seed(count)
+}
 
 function handleProgress(value) {
   progress.value = value
@@ -36,8 +80,8 @@ function handleReset() {
   <main class="page">
     <h1 class="page__title">刮刮乐</h1>
     <p class="page__hint">
-      按住鼠标或手指拖动刮开涂层；拖动窗口边缘、缩放浏览器或切换下方开关，
-      刮痕与进度都会保留
+      按住鼠标或手指拖动刮开涂层；支持撤销/重做、存档恢复；拖动窗口边缘、
+      缩放浏览器或切换下方开关，刮痕与进度都会保留
     </p>
 
     <!-- 卡片容器：宽度 min(92vw, 520px)，响应式模式下卡片撑满并自动跟随 -->
@@ -52,6 +96,8 @@ function handleReset() {
         :brush-size="30"
         :cover-color="coverColor"
         :cover-text="coverText"
+        :max-history="maxHistory"
+        :rasterize-after="500"
         @progress="handleProgress"
         @finish="handleFinish"
       >
@@ -69,9 +115,25 @@ function handleReset() {
       <template v-if="finished"> · 恭喜中奖 🎉</template>
     </p>
 
-    <button class="reset-btn" type="button" @click="handleReset">
-      重置
-    </button>
+    <!-- 历史与存档工具条 -->
+    <div class="toolbar">
+      <button class="tool-btn" type="button" :disabled="!canUndo" @click="cardRef?.undo()">
+        撤销
+      </button>
+      <button class="tool-btn" type="button" :disabled="!canRedo" @click="cardRef?.redo()">
+        重做
+      </button>
+      <button class="tool-btn" type="button" @click="handleSave">存档</button>
+      <button class="tool-btn" type="button" :disabled="!hasSnapshot" @click="handleRestore">
+        恢复
+      </button>
+      <button class="reset-btn" type="button" @click="handleReset">重置</button>
+    </div>
+    <p v-if="hasSnapshot" class="snapshot-info">
+      快照 {{ (snapshotSize / 1024).toFixed(1) }} KB（内存中；持久化可存
+      IndexedDB，Uint8Array 可直接结构化克隆，无需 base64）
+    </p>
+    <p v-if="snapshotError" class="snapshot-error">{{ snapshotError }}</p>
 
     <!-- 运营面板：所有修改运行时立即生效，不影响已有刮痕 -->
     <section class="panel">
@@ -127,6 +189,22 @@ function handleReset() {
           {{ responsive ? '宽度撑满容器，高宽比 16:9' : '固定 320 × 190' }}
         </span>
       </label>
+    </section>
+
+    <!-- 调试面板：压测注入与重放计时 -->
+    <section class="panel panel--debug">
+      <h2 class="panel__title">调试面板</h2>
+      <div class="field">
+        <span class="field__label">压测注入</span>
+        <div class="debug-btns">
+          <button class="tool-btn" type="button" @click="seed(50)">注入 50 笔</button>
+          <button class="tool-btn" type="button" @click="seed(5000)">注入 5000 笔</button>
+        </div>
+        <span class="field__desc">
+          控制台执行 window.__SCRATCH_DEBUG__ = true 后拖动窗口边缘，
+          对比两种规模下的重放耗时日志（详见 README）
+        </span>
+      </div>
     </section>
   </main>
 </template>
@@ -213,6 +291,40 @@ function handleReset() {
   font-weight: 600;
 }
 
+/* ---------- 工具条 ---------- */
+
+.toolbar {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.tool-btn {
+  padding: 9px 22px;
+  font-size: 15px;
+  color: #2563eb;
+  background: #fff;
+  border: 1px solid #2563eb;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background-color 0.2s, transform 0.1s;
+}
+
+.tool-btn:hover:not(:disabled) {
+  background: #eff6ff;
+}
+
+.tool-btn:disabled {
+  color: #9ca3af;
+  border-color: #d1d5db;
+  cursor: not-allowed;
+}
+
+.tool-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
 .reset-btn {
   padding: 9px 34px;
   font-size: 15px;
@@ -232,6 +344,18 @@ function handleReset() {
   transform: scale(0.96);
 }
 
+.snapshot-info {
+  margin: 0;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.snapshot-error {
+  margin: 0;
+  font-size: 13px;
+  color: #dc2626;
+}
+
 /* ---------- 运营面板 ---------- */
 
 .panel {
@@ -245,6 +369,10 @@ function handleReset() {
   border: 1px solid #e5e7eb;
   border-radius: 12px;
   box-sizing: border-box;
+}
+
+.panel--debug {
+  border-style: dashed;
 }
 
 .panel__title {
@@ -329,5 +457,10 @@ function handleReset() {
 .field__desc {
   font-size: 13px;
   color: #8a909c;
+}
+
+.debug-btns {
+  display: flex;
+  gap: 10px;
 }
 </style>
