@@ -51,6 +51,29 @@ import { encodeSnapshot, decodeSnapshot } from '../scratchCodec.js'
  * 换肤只重绘涂层外观，不触碰任何笔迹几何（slots/遮罩都不变），redo
  * 恢复的是几何而非外观，因此 redo 栈原样保留、canRedo 不变。唯一会
  * 清空 redo 栈的动作是「刮出新的一笔」（编辑器标准语义）与 reset。
+ *
+ * ------------------------------------------------------------------
+ * v4 新增：sleep()/wake() 视口感知休眠（仅新增，不改任何 v3 接口）
+ * ------------------------------------------------------------------
+ * sleep() 产出一张完整快照（sleepBytes，含全部矢量 + 两张固化网格 +
+ * redo 栈），随后释放全部 GPU/离屏位图与 JS 笔迹状态，组件进入
+ * sleeping：canvas 元素保留（DOM/样式/插槽不变）但 backing store
+ * 被置 0 尺寸。wake() 用该快照走与 restore() 完全相同的重建路径，
+ * 当帧（一次同步 rebuild）恢复完整刮痕与进度，因此 resize、DPR 变化、
+ * undo 跨固化边界在唤醒后全部沿用 v3 已验证的同一代码路径，语义为：
+ *   - redo 栈：快照内逐字带回，休眠前后 canRedo 不变；
+ *   - 完成态：finished 标志原样带回（已完成的卡唤醒后仍不可 undo）；
+ *   - solid 加速网格：v2 快照携带 solidMask 网格，唤醒只需
+ *     drawImage（两次位图搬运）即 1 帧出图；它只是缓存，唤醒后 undo
+ *     跨固化边界仍触发矢量重建（solidDirty），逐像素正确；
+ *   - DPR 变化：唤醒时 rebuildCanvas(true) 取当前 devicePixelRatio，
+ *     两张网格按 v3 migrateMasks 的缩放/重建路径处理。
+ *
+ * 交织场景①「多指刮擦中被滚出视口」的取舍：休眠必须无损但又不能等待
+ * 指针抬起（滚出视口时没有可靠的 pointerup）。选择「把进行中的每一指
+ * 笔迹就地确认」——它们在视觉上已经刮在主画布上，确认进 undoStack 后
+ * 正常进入快照，既不丢笔迹也不阻塞休眠；这也符合「刮了就算数」的
+ * 产品直觉。唤醒后这些笔是已确认笔，可正常 undo 逐笔回退。
  */
 
 const props = defineProps({
@@ -85,6 +108,12 @@ const props = defineProps({
    * 历史上限丢进永久层）；演示页把 maxHistory 调到 5000 即可观察。
    */
   rasterizeAfter: { type: Number, default: 500 },
+  /**
+   * v4 新增：挂载时直接以「休眠态」启动（不分配任何 backing store）。
+   * 多卡墙初始最多 50 张卡，只有视口内的卡会被 wake()，其余保持休眠，
+   * 避免首屏同时建 50 张 canvas。只对初始挂载有意义。
+   */
+  startSleeping: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['progress', 'finish'])
@@ -101,6 +130,16 @@ let dpr = 1
 let cssWidth = 0
 let cssHeight = 0
 let initialized = false
+
+/**
+ * v4 休眠态（见文件头「视口感知休眠」）。休眠中：
+ * - 全部 canvas backing store / 离屏位图 / slots 矢量均已释放；
+ * - sleepBytes 持有可完整重建状态的单卡快照（null=空白休眠卡）；
+ * - 重建相关监听（ResizeObserver/DPR media）照常保留，rebuildCanvas
+ *   开头直接短路，唤醒前不会偷偷重建画布。
+ */
+const isSleeping = ref(false)
+let sleepBytes = null
 
 /** 是否已经完成（达到阈值，正在/已经淡出）；完成后 undo/redo 禁用 */
 let finished = false
@@ -145,6 +184,13 @@ let frozenMask = null
 let frozenCtx = null
 /** restore 时暂存的永久层网格画布，rebuildCanvas 消费一次后清空 */
 let frozenBaseGrid = null
+/**
+ * v4：restore/唤醒时暂存的「可重建固化层」加速网格画布（来自 v2
+ * 快照的 solid 字段），migrateMasks 消费一次后清空。语义上只是缓存：
+ * 已固化笔数 <= SOLID_SYNC_BUDGET 时矢量重建结果优先（逐像素等价），
+ * 超限才先 drawImage 该网格保证当帧出图、再异步矢量重建。
+ */
+let solidBaseGrid = null
 
 /* ---------- 指针 ---------- */
 
@@ -297,22 +343,42 @@ function migrateMasks() {
 
   const committed = committedCount()
   if (solidMask || committed > 0) {
-    // 无旧位图可缩放时（restore 后）必须走矢量重建，否则固化层丢失
-    if (committed <= SOLID_SYNC_BUDGET || !solidMask) {
+    // 无旧位图可缩放时（restore/唤醒后）：优先走矢量重建，否则固化层丢失
+    if (committed <= SOLID_SYNC_BUDGET || (!solidMask && !solidBaseGrid)) {
       rebuildSolidMask()
     } else {
-      const scaled = scaleMask(solidMask)
+      // 矢量过多（同步重栅格化会突破帧预算）：先用旧位图或唤醒加速网格
+      // 等比搬一帧（O(像素) drawImage），多卡墙「唤醒 1 帧内恢复完整
+      // 刮痕」的硬要求即由这条路径保证。
+      // - 来源是旧 solidMask（真实 resize/DPR 变化）：标脏并安排下一帧
+      //   矢量重建，消除一次性缩放模糊；
+      // - 来源是唤醒加速网格（刚 restore/唤醒，几何与保存时一致、本就
+      //   是降采样缓存）：不预排重建——首次 undo/redo 跨固化边界或下次
+      //   真实尺寸变化时自会走矢量重建路径精确化。
+      const source = solidMask || solidBaseGrid
+      const scaled = createMaskCanvas()
+      scaled.ctx.drawImage(
+        source,
+        0, 0, source.width, source.height,
+        0, 0, cssWidth, cssHeight
+      )
       solidMask = scaled.canvas
       solidCtx = scaled.ctx
-      solidDirty = true
-      scheduleMaintenance()
+      if (source !== solidBaseGrid) {
+        solidDirty = true
+        scheduleMaintenance()
+      }
     }
   }
+  solidBaseGrid = null
 }
 
 function rebuildCanvas(force = false) {
   const canvas = canvasRef.value
   if (!canvas) return
+  // 休眠态不允许任何隐式重建（resize/DPR 变化也只记录、不分配显存）；
+  // wake() 会先解除休眠再强制 rebuild，届时拿到的就是最新尺寸/DPR。
+  if (isSleeping.value) return
 
   watchDpr()
 
@@ -639,9 +705,16 @@ function recordPoint(slot, point) {
 }
 
 function onPointerDown(event) {
-  if (finished) return
+  if (finished || isSleeping.value) return
   event.preventDefault()
-  event.currentTarget.setPointerCapture(event.pointerId)
+  // 合成事件 / 指针已被隐式取消（滚出视口、浏览器抢占）时 capture 可能
+  // 抛 NotFoundError；捕获只是优化（后续 move 仍会命中元素），失败不应
+  // 让整次 pointerdown 中断（否则该笔笔迹丢失）
+  try {
+    event.currentTarget.setPointerCapture(event.pointerId)
+  } catch {
+    /* 无活动指针：忽略，继续记录笔迹 */
+  }
   // 新一笔刮擦解除 restore/压测的 finish 抑制：此后测量达阈值正常完成
   suppressFinish = false
   // 新笔画使 redo 失效（标准编辑器语义），死亡槽位一并回收
@@ -665,7 +738,7 @@ function onPointerDown(event) {
 
 function onPointerMove(event) {
   const active = activePointers.get(event.pointerId)
-  if (finished || !active) return
+  if (finished || !active || isSleeping.value) return
   event.preventDefault()
 
   const coalesced =
@@ -787,6 +860,7 @@ function clearHistoryState() {
   solidDirty = false
   frozenDirty = false
   frozenBaseGrid = null
+  solidBaseGrid = null
   solidMask = null
   solidCtx = null
   frozenMask = null
@@ -815,6 +889,11 @@ function cancelFade() {
 
 /** 对外暴露：恢复完整涂层、进度归零、撤销栈清空，可再次刮开 */
 function reset() {
+  if (isSleeping.value) {
+    // 休眠卡 reset：丢弃离线状态，唤醒为一张全新空白卡
+    isSleeping.value = false
+    sleepBytes = null
+  }
   activePointers.clear()
   clearHistoryState()
   suppressFinish = false
@@ -887,8 +966,20 @@ function gridToCanvas(grid) {
  *
  * 边界场景⑤：save 发生在 rAF 重建/维护挂起期间——先把挂起的
  * rebuild 与 maintenance 同步冲刷掉，保证快照是最终一致状态。
+ *
+ * v4 新增 options.includeSolid：休眠快照携带 solidMask 加速网格
+ * （v2 段），让唤醒只需位图 drawImage 即可 1 帧出图。网格导致超
+ * 2MB 时自动去掉 solid 重试（退化为 v1，唤醒改走矢量重建），
+ * 因此休眠永远不会因为体积上限而失败。默认 false：常规 save()
+ * 产出的仍是与 v3 完全一致的字节，v3 旧解码器可读（向前兼容）。
  */
-function save() {
+function save(options = {}) {
+  if (isSleeping.value) {
+    // 休眠卡的可序列化状态就是 sleepBytes（空白卡为 null）；返回副本，
+    // 调用方拿到的快照不随下次唤醒而失效。墙 saveAll 直接复用同一份字节。
+    if (!sleepBytes) throw new Error('[scratch] 空白休眠卡无可存档内容')
+    return sleepBytes.slice()
+  }
   if (!initialized) throw new Error('[scratch] 组件尚未初始化，无法存档')
   if (rebuildRaf) {
     cancelAnimationFrame(rebuildRaf)
@@ -897,10 +988,23 @@ function save() {
   }
   if (maintenanceRaf) {
     cancelAnimationFrame(maintenanceRaf)
-    maintenanceRaf = 0
-    runMaintenance()
+      maintenanceRaf = 0
+      runMaintenance()
   }
 
+  const payload = buildSnapshotPayload(!!options.includeSolid)
+  if (!options.includeSolid) return encodeSnapshot(payload)
+  try {
+    return encodeSnapshot(payload)
+  } catch (err) {
+    // 仅体积上限类错误可降级；其他（不应发生）错误照常抛出
+    if (!String(err?.message || '').includes('上限')) throw err
+    return encodeSnapshot({ ...payload, solid: null })
+  }
+}
+
+/** 组装 encodeSnapshot 入参（save 与 sleep 共用，保证两处口径一致） */
+function buildSnapshotPayload(includeSolid) {
   const strokes = slots.map((slot, index) => ({
     i: index,
     w: slot.w,
@@ -917,8 +1021,7 @@ function save() {
     const index = slotIndexById.get(id)
     if (index !== undefined) redo.push(index)
   }
-
-  return encodeSnapshot({
+  return {
     cssWidth,
     cssHeight,
     dpr,
@@ -926,10 +1029,10 @@ function save() {
     finished,
     strokes,
     solidTo,
-    solid: null,
+    solid: includeSolid && solidMask ? maskToGrid(solidMask) : null,
     perm: frozenDirty && frozenMask ? maskToGrid(frozenMask) : null,
     redo,
-  })
+  }
 }
 
 /**
@@ -950,6 +1053,13 @@ function save() {
  */
 function restore(snapshot) {
   const data = decodeSnapshot(snapshot) // 非法快照在此抛错，当前状态不受影响
+
+  // 休眠中被直接 restore（调用方持有卡片句柄的场景）：先退出休眠，
+  // 丢弃旧休眠字节（新快照已覆盖全部状态），再走统一恢复路径
+  if (isSleeping.value) {
+    isSleeping.value = false
+    sleepBytes = null
+  }
 
   // 清挂起任务与指针，避免旧 rAF 在新状态上重放
   if (rebuildRaf) {
@@ -988,7 +1098,14 @@ function restore(snapshot) {
     }
     blocks.push(ids)
   }
-  if (solidTo > 0) solidDirty = true // 下一帧从矢量重栅格化固化层
+  // 固化前缀的重建策略（v4 唤醒 1 帧出图的关键）：
+  // - 无加速网格（v3/v1 快照）：标脏，migrateMasks 走矢量重建，
+  //   与 v3 restore 行为完全一致；
+  // - 有 v2 solid 加速网格：migrateMasks 直接 drawImage 网格当帧出图，
+  //   这里不预标脏，避免唤醒后立刻同步重栅格化数千笔（突破帧预算）。
+  //   网格在几何上就是上次保存时 solidMask 的降采样，视觉等价；之后
+  //   第一次 undo/redo 跨固化边界时自然置 solidDirty 做矢量精确重建。
+  if (solidTo > 0 && !data.solid) solidDirty = true
   // redo 栈（快照里是槽位下标，映射回新 id）
   for (const index of data.redo) {
     const slot = slots[index]
@@ -998,6 +1115,11 @@ function restore(snapshot) {
   if (data.perm) {
     frozenBaseGrid = gridToCanvas(data.perm)
     frozenDirty = true
+  }
+  // v2 快照的可重建固化层加速网格（v3/v1 快照没有该字段 => null，
+  // 走纯矢量重建，行为与 v3 restore 完全一致）
+  if (data.solid) {
+    solidBaseGrid = gridToCanvas(data.solid)
   }
 
   cancelFade()
@@ -1027,6 +1149,168 @@ function restore(snapshot) {
   if (data.finished) emit('finish') // 让调用方同步完成态
 }
 
+/* ================= v4：视口感知休眠 / 唤醒 ================= */
+
+/** 是否存在任何在册笔迹（空白卡休眠不必产生快照字节，墙据此计 0 预算） */
+function hasContent() {
+  return slots.length > 0 || frozenDirty || !!solidMask
+}
+
+/**
+ * 释放全部显示资源并进入休眠标记（sleep 与 adoptOffline 共用，保证
+ * 两条挂起路径的清理口径逐行一致）：取消定时器/rAF、清空时间线与
+ * 两张离屏位图（clearHistoryState）、主 canvas backing store 置 0、
+ * 采样画布与尺寸状态复位。
+ */
+function releaseDisplayResources() {
+  activePointers.clear()
+  if (sampleTimer) {
+    clearTimeout(sampleTimer)
+    sampleTimer = 0
+  }
+  if (fadeTimer) {
+    clearTimeout(fadeTimer)
+    fadeTimer = 0
+  }
+  if (rebuildRaf) {
+    cancelAnimationFrame(rebuildRaf)
+    rebuildRaf = 0
+  }
+  if (maintenanceRaf) {
+    cancelAnimationFrame(maintenanceRaf)
+    maintenanceRaf = 0
+  }
+  clearHistoryState()
+  const canvas = canvasRef.value
+  if (canvas) {
+    // 先复位淡出相关样式，唤醒后 restore 会按快照 finished 重新落到终态
+    canvas.classList.remove('scratch-canvas--fading', 'scratch-canvas--instant')
+    canvas.style.visibility = ''
+    canvas.width = 0
+    canvas.height = 0
+  }
+  ctx = null
+  sampleCanvas = null
+  sampleCtx = null
+  sampleCols = 0
+  sampleRows = 0
+  cssWidth = 0
+  cssHeight = 0
+  initialized = false
+  finished = false
+  suppressFinish = false
+  lastProgress = 0
+  isSleeping.value = true
+  canUndo.value = false
+  canRedo.value = false
+}
+
+/**
+ * 休眠：滚出视口时由墙调用。幂等。
+ *
+ * 顺序设计（对应交织场景①：多指刮擦中被滚出视口）：
+ * 1. 进行中的每一指笔迹「就地确认」进 undoStack（见文件头取舍说明），
+ *    先主动 releasePointerCapture 再清表，避免浏览器把后续事件投递给
+ *    已释放 backing store 的 canvas；
+ * 2. 与 save() 同一口径冲刷挂起 rAF 并生成快照（含 solid 加速网格，
+ *    超 2MB 自动降级 v1），空白卡存 null（零预算）；
+ * 3. 取消淡出定时器、清空全部 JS 状态与离屏位图，主 canvas backing
+ *    store 置 0 尺寸——浏览器据此立即释放该 canvas 的显存/位图内存。
+ * DOM、插槽奖品层、事件监听、ResizeObserver 全部保留。
+ */
+function sleep() {
+  if (isSleeping.value) return sleepBytes
+
+  // 1) 进行中笔迹确认：它们已经画在主画布上，确认后即可无损入快照
+  for (const [pointerId, active] of activePointers) {
+    const target = canvasRef.value
+    try {
+      target?.releasePointerCapture?.(pointerId)
+    } catch {
+      /* 某些时序下 capture 已随滚动失效，忽略即可 */
+    }
+    if (active.slot.pts.length && !undoStack.includes(active.slot.id)) {
+      undoStack.push(active.slot.id)
+    }
+  }
+  activePointers.clear()
+
+  // 2) 冲刷挂起任务 -> 最终一致快照（空白卡不产生字节）
+  if (initialized && hasContent()) {
+    if (rebuildRaf) {
+      cancelAnimationFrame(rebuildRaf)
+      rebuildRaf = 0
+      rebuildCanvas()
+    }
+    if (maintenanceRaf) {
+      cancelAnimationFrame(maintenanceRaf)
+      maintenanceRaf = 0
+      runMaintenance()
+    }
+    sleepBytes = save({ includeSolid: true })
+  } else {
+    sleepBytes = null
+  }
+
+  // 3) 释放全部显示/离屏 backing store 与 JS 笔迹状态
+  releaseDisplayResources()
+  return sleepBytes
+}
+
+/**
+ * 唤醒：滚回视口时由墙调用。一次同步 rebuild 完成恢复（1 帧内）。
+ * - 有快照：走与 restore() 相同的装填 + rebuildCanvas(true) 路径，
+ *   DPR/尺寸按当前环境取最新值（交织场景④：跨屏拖动后唤醒也正确）；
+ * - 空白卡：仅解除休眠并建一张全新涂层（无快照解码开销）。
+ * 幂等：重复唤醒直接返回。
+ */
+function wake() {
+  if (!isSleeping.value) return
+  isSleeping.value = false
+  const bytes = sleepBytes
+  sleepBytes = null
+  if (bytes) {
+    restore(bytes)
+  } else {
+    rebuildCanvas(true)
+    syncFlags()
+  }
+}
+
+/** 休眠快照字节（休眠中返回 Uint8Array|null，非休眠态返回 null） */
+function getSleepBytes() {
+  return sleepBytes
+}
+
+/**
+ * 以「外部离线快照」进入休眠态：组件可能刚挂载（初始空白、已分配过
+ * backing store），先清掉自身状态再挂起，sleepBytes 由外部提供。
+ * 墙批量恢复时视口外卡经此零显存落位（传 null = 空白休眠卡）。
+ * 若组件已经处于休眠态，仅替换挂起字节（滚动恢复对账时幂等）。
+ */
+function adoptOffline(bytes) {
+  if (!isSleeping.value) {
+    releaseDisplayResources()
+  }
+  sleepBytes = bytes ?? null
+  return sleepBytes
+}
+
+/**
+ * 当前持有的显示用位图内存估算（字节，4 字节/像素 RGBA）：
+ * 主 canvas + solidMask + frozenMask + 采样小画布。供墙调试面板显示
+ * 「活跃卡显存量级」；预算只统计休眠/冷档字节（墙代码注释给出口径）。
+ */
+function gpuBytes() {
+  let total = 0
+  const canvas = canvasRef.value
+  if (canvas && canvas.width > 0) total += canvas.width * canvas.height * 4
+  if (solidMask) total += solidMask.width * solidMask.height * 4
+  if (frozenMask) total += frozenMask.width * frozenMask.height * 4
+  if (sampleCanvas) total += sampleCanvas.width * sampleCanvas.height * 4
+  return total
+}
+
 /* ================= 调试：压测注入（仅调试开关下使用） ================= */
 
 /**
@@ -1036,7 +1320,7 @@ function restore(snapshot) {
  * 干扰 resize 计时观察）。
  */
 function seedStrokes(count) {
-  if (!initialized || finished) return
+  if (!initialized || finished || isSleeping.value) return
   clearRedo()
   suppressFinish = true // 见变量注释：压测覆盖率必然越阈
   let s = 12345 // LCG，可复现
@@ -1107,7 +1391,15 @@ watch(
 )
 
 onMounted(() => {
-  rebuildCanvas(true)
+  if (props.startSleeping) {
+    // 墙内非首屏卡：0 backing store 挂起，等墙 wake()；观察者照常挂上，
+    // 唤醒前所有回调都被 rebuildCanvas 开头的休眠短路挡住
+    isSleeping.value = true
+    cssWidth = 0
+    cssHeight = 0
+  } else {
+    rebuildCanvas(true)
+  }
   resizeObserver = new ResizeObserver(scheduleRebuild)
   resizeObserver.observe(rootRef.value)
   window.addEventListener('resize', scheduleRebuild)
@@ -1135,7 +1427,21 @@ defineExpose({
   restore,
   canUndo,
   canRedo,
-  __debug: { seed: seedStrokes, replayMs: () => lastReplayMs },
+  // ---- v4 新增（仅新增，不改变以上任何 v3 成员语义）----
+  sleep,
+  wake,
+  adoptOffline,
+  isSleeping,
+  getSleepBytes,
+  hasContent,
+  gpuBytes,
+  __debug: {
+    seed: seedStrokes,
+    replayMs: () => lastReplayMs,
+    gpuBytes,
+    getSleepBytes,
+    isSleeping: () => isSleeping.value,
+  },
 })
 </script>
 

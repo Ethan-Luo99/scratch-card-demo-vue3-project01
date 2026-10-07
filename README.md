@@ -149,3 +149,114 @@ redo 恢复的是几何而非外观，因此 redo 栈原样保留（注释见组
 - 快速甩动粗线段连接 + `getCoalescedEvents()` 补点，笔迹连续；
 - ResizeObserver + matchMedia(resolution) 监听尺寸/DPR，rAF 合并重建；
 - `visibilitychange` 清理悬挂指针状态。
+
+---
+
+# v4：多卡运营墙（ScratchCardWall）
+
+在 v3 单卡能力**零接口改动**（props/事件/暴露方法语义全部保留，仅新增）
+之上，新增「多卡运营墙」：纵向滚动网格最多陈列 50 张卡，长时间挂机下
+控制总内存与滚动流畅度，无任何额外运行时依赖。
+
+## 运行
+
+```bash
+npm run dev   # 打开后默认就是「多卡墙」页；顶部可切回「v3 单卡」原演示
+```
+
+## 新增文件与改动
+
+- `src/components/ScratchCardWall.vue`：墙组件（视口感知、LRU、冷池、saveAll/restore）
+- `src/wallCodec.js`：`SCW` 墙容器二进制格式 + v3 单卡→墙迁移 + 单卡段提取
+- `src/scratchCodec.js`：单卡格式 v1→v2（仅放开 `solidPresent=1`，布局字节
+  完全相同），解码器同时接受 v1/v2；无 solid 时仍写 v1（v3 旧解码器可读）
+- `src/components/ScratchCard.vue`：仅**新增** `sleep()/wake()/adoptOffline()`
+  等休眠能力与 `startSleeping` prop；v3 接口不变
+- `src/components/SingleCardDemo.vue`：原 App.vue 的 v3 单卡演示（内容不变）
+
+## 墙组件 API
+
+- props：`cards`（卡槽数组，经 `#default="{ card, index, state }"` 作用域
+  插槽传奖品内容）、`maxCards`（默认 50）、`wallMemoryBudget`（默认 16MB）、
+  `coldMemoryBudget`（默认 8MB）、`cardProps`（透传给每张卡的 v3 props）、
+  `rootMargin`（视口预唤醒提前量 px，默认 200）
+- 事件：`progress`/`finish`（载荷 `{index, value}` / `{index}`）、
+  `onCardArchived`→`card-archived` `{index, bytes, lastUsedAt}`、
+  `onCardDiscarded`→`card-discarded` `{index, reason, bytes}`、
+  `card-state-change` `{index, state}`
+- 暴露：`saveAll()`、`restore(archive)`（别名 `restoreAll`）、
+  `getCard(index)`、`getCardSnapshot(archive, index)`、`stats`、`cardStates`
+- 调试：`__seedCard(index, n)`、`__fastScroll(down?)`、
+  `__forceEvict(index?)`、`__enforceBudgets()`、`__stats()`
+
+## 休眠/恢复语义（ScratchCard 新增）
+
+- 滚出视口 → `sleep()`：进行中多指笔迹**就地确认**进撤销栈（刮了就算数，
+  不丢笔、不等抬起），生成含两张固化网格的完整快照（v2 段），随后主
+  canvas 与两张离屏 mask 的 backing store 全部置 0 尺寸（显存立即释放），
+  slots/redo 等 JS 状态清空；DOM/插槽/监听保留
+- 滚回视口 → `wake()`：一次同步 `rebuildCanvas(true)`，**1 帧内**恢复完整
+  刮痕与进度；solid 加速网格让唤醒退化为位图 drawImage（数千笔也不重栅格化），
+  唤醒后首次 undo/redo 跨固化边界才触发矢量精确重建（逐像素等价）
+- redo 栈、完成态、阈值/换肤全部随快照带回；DPR/尺寸按唤醒当时的环境取最新值
+
+## 内存预算公式（明确口径，代码注释同文）
+
+```
+sleepBudgetBytes = Σ sleeping 卡 sleepBytes.byteLength     （空白卡 = 0）
+                 必须 <= wallMemoryBudget（默认 16MB）
+coldBudgetBytes  = Σ coldPool 冷档 Uint8Array.byteLength
+                 必须 <= coldMemoryBudget（默认 8MB）
+```
+
+- 休眠字节**含两张固化位图网格**（solid 加速 + frozen 永久层），按序列化
+  后真实字节数记账；活跃卡显存不计入离线预算（面板单独显示 `activeBytes`）
+- 超 wallMemoryBudget：在 sleeping 卡中按 `lastUsedAt` 最旧（并列取小索引，
+  确定性）LRU 淘汰进冷池，冷段直接复用 `save()` 产物（最紧凑可序列化形式）
+- 冷池超 coldMemoryBudget：按入池顺序（天然最旧）丢弃，置 `discarded`
+- `lastUsedAt` 只在显式交互（刮擦/undo/redo/seed…）时刷新，**单纯滚回视口
+  不算交互**，否则快速来回滚动会让没被玩过的卡永远最新、LRU 失效
+- 空白休眠卡 0 字节、不参与预算淘汰（只可能被「立即淘汰」手动丢弃）
+
+## 墙归档格式（`SCW`，单归档 ≤ 8MB，超限抛错）
+
+```
+magic 'S''C''W' | u8 version | u32 totalLen | u16 cardCount
+u32 jsonLen | 配置 JSON（maxCards/预算/卡数/时间戳）
+每卡：u8 state(0=活/休眠 1=冷档 2=丢弃) | state≠2 时 u32 segLen | 单卡 'SC1' 段
+      （state=0 且 segLen=0 = 从未刮过的空白活卡）
+```
+
+- **段即单卡快照**：`getCardSnapshot(archive, i)`（零拷贝 subarray）取出后
+  可直接 `ScratchCard.restore()`；墙段与单卡完全互认
+- **v3 单卡 → 墙**：`restore(v3单卡Uint8Array)` 自动经
+  `migrateV3CardToWall()` 纯包封成 1 卡墙（不解码不重编码，段字节逐字节保留）
+- **旧编码器冷段**：v1（v3）与 v2 段同一字节布局，解码器同时接受，
+  冷档激活走同一 restore 路径，即版本迁移路径
+- 卡数 vs `maxCards`：`count <= maxCards` 正常恢复（多出当前 cards 的槽位
+  建内部记录+占位，等调用方补数据）；`count > maxCards` **直接抛错**——
+  静默裁剪是不可察觉的数据丢失，扩容又违反容量契约，要求先调大 maxCards
+
+## 验收/手工验证指引（对照需求逐项）
+
+1. **休眠释放显存、1 帧恢复**：切 50 卡，刮/灌 #0 几笔 → 「滚到底」。
+   顶部统计「活跃显存」下降、「休眠离线」上涨；「每卡状态」网格对应卡变
+   「休眠」。滚回后刮痕原样、undo/redo 可用。控制台
+   `window.__SCRATCH_DEBUG__=true` 可看重放耗时
+2. **交织①多指刮擦中滚出**：真实触屏/鼠标按住画一半不松，另一手滚动
+   （演示页可直接快速甩滚），卡滚出时进行中笔迹被确认保留，滚回后可逐笔 undo
+3. **交织②滚动中 saveAll**：快速滚动途中点「saveAll」不报错，归档可 restore
+4. **交织③冷池淘汰与跨固化 undo 同帧**：休眠预算调到 0.1MB、冷池 0.05MB，
+   给某卡灌 3000 笔（触发固化），滚动淘汰的同时对在屏卡连点撤销——互不影响
+5. **交织④恢复中 DPR 变化**：把浏览器窗口从普通屏拖到高清屏（或 DevTools
+   切 DPR）后再 restore；唤醒卡 backing 按新 DPR 重建（代码路径：唤醒读
+   实时 devicePixelRatio + 各卡 resolution 监听补迁移）
+6. **交织⑤旧版本编码器冷段**：v3 保存的 v1 快照可直接「到单卡页恢复」，
+   也可被墙 restore；冷档激活同路径（演示页提取卡段按钮可验）
+7. **批量兼容**：墙 saveAll → 「提取 #0」→ 切「v3 单卡」页恢复；
+   v3 单卡存档 `wall.restore(bytes)` 变 1 卡墙
+8. **预算/LRU**：调小「休眠预算」点「执行预算检查」，事件日志按最旧顺序
+   报「进入冷存档」；调小「冷池预算」，超出按入池顺序「冷档被丢弃」
+9. **调试辅助**：卡片数量切换（1/6/12/30/50）、向指定卡灌入大量笔迹、
+   模拟快速滚动（滚到底/回顶）、强制内存淘汰（指定 # 或自动 LRU）、
+   每卡状态+内存量级网格、三级内存统计条、淘汰事件日志

@@ -16,24 +16,54 @@
  *     含抗锯齿边缘的噪点行则原样存储，保证 RLE 永不把数据放大。
  *
  * 布局（小端序）：
- *   magic 'S''C''1' | u8 version(=1)
+ *   magic 'S''C''1' | u8 version
  *   f32 cssWidth | f32 cssHeight | u8 dprFixed1(=round(dpr*10)) | u8 progress | u8 finished
  *   varint strokeCount
  *     每笔：varint slotIndex | u16 widthFixed | u8 flags(bit0=alive)
  *           varint pointCount | 每点 zigzagVarint dx, zigzagVarint dy（相对上一点，初始 prev=0）
  *   varint solidTo
- *   u8 solidPresent  （存在时）u8 cell | u16 cols | u16 rows | u32 len | alpha 网格
+ *   u8 solidPresent  （version>=2 且存在时）u8 cell | u16 cols | u16 rows | u32 len | alpha 网格
  *   u8 permPresent   （存在时）同上
  *   varint redoCount | 每项 varint slotIndex
  *
  * 网格每行：u8 tag（0=原始，后接 cols 字节；1=RLE，后接若干 [varint run,u8 value]）
+ *
+ * 版本策略（v4 多卡墙引入，保持 v3 完全兼容）：
+ * - version=1（v3）：solidPresent 字节始终存在但恒为 0，即 solid 层不
+ *   持久化（restore 时由矢量重栅格化）。
+ * - version=2（v4）：字节布局与 v1 完全相同（solidPresent 位本就存在），
+ *   仅放开 solidPresent=1——存在时携带
+ *   「休眠唤醒加速网格」。多卡墙休眠卡恢复必须 1 帧内出图，若每次都从
+ *   矢量重栅格化（最坏 2000+ 笔）可能突破帧预算；带上 solid 位图后唤醒
+ *   退化为两次 drawImage。它只是加速缓存：
+ *     · 唤醒后 undo 跨固化边界仍标 solidDirty 走矢量重建，逐像素等价；
+ *     · DPR/尺寸变化先缩放网格（与 frozen 层同路径），超限再异步重建；
+ *     · 带网格导致超 2MB 时，编码侧自动降级为 v1（无 solid），
+ *       因此 v3 的解码器读到的 v1 段永远合法（向前兼容）。
+ * - 升级 v1 -> v2 是无损「隐式迁移」：v1 段直接可解，solid 缺省为 null，
+ *   下次 save/sleep 时按需重新生成；decodeSnapshot 同时接受 v1/v2。
  */
 
-export const SNAPSHOT_VERSION = 1
+export const SNAPSHOT_VERSION = 2
+export const SNAPSHOT_VERSION_V3 = 1
 export const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
 
-const MAGIC = [0x53, 0x43, 0x31] // 'SC1'
+export const CARD_MAGIC = [0x53, 0x43, 0x31] // 'SC1'
+const MAGIC = CARD_MAGIC
 const FIXED_ONE = 65535 // 归一化坐标 / 笔宽的定点基数
+
+/**
+ * 识别一段二进制是否为单卡快照（magic + 合法版本）。
+ * wallCodec 迁移 / wallRestore 接受裸单卡快照时使用。
+ */
+export function isCardSnapshot(bytes) {
+  if (!(bytes instanceof Uint8Array)) return false
+  return (
+    bytes.length >= 4 &&
+    MAGIC.every((b, idx) => bytes[idx] === b) &&
+    (bytes[3] === SNAPSHOT_VERSION_V3 || bytes[3] === SNAPSHOT_VERSION)
+  )
+}
 
 /* ---------------- varint / zigzag（LEB128 小端） ---------------- */
 
@@ -247,7 +277,9 @@ function decodeGrid(reader) {
 export function encodeSnapshot(data) {
   const writer = new ByteWriter()
   MAGIC.forEach((b) => writer.u8(b))
-  writer.u8(SNAPSHOT_VERSION)
+  // 无 solid 加速网格时仍写 v1：v3 的旧解码器无需任何改动即可读 v4
+  // 休眠外常规 save() 产生的快照（向前兼容）；携带加速网格才写 v2。
+  writer.u8(data.solid ? SNAPSHOT_VERSION : SNAPSHOT_VERSION_V3)
   writer.f32(data.cssWidth)
   writer.f32(data.cssHeight)
   writer.u8(Math.round(data.dpr * 10))
@@ -319,7 +351,9 @@ export function decodeSnapshot(input) {
   const reader = new ByteReader(bytes)
   MAGIC.forEach(() => reader.u8())
   const version = reader.u8()
-  if (version !== SNAPSHOT_VERSION) {
+  // v1（v3 旧快照，solidPresent 恒 0）与 v2（带唤醒加速网格）同布局，
+  // 一并接受——这是「旧编码器产物可被新墙恢复」的版本迁移入口。
+  if (version !== SNAPSHOT_VERSION && version !== SNAPSHOT_VERSION_V3) {
     throw new Error(`[scratch] 不支持的快照版本：${version}`)
   }
 
