@@ -35,6 +35,43 @@ export const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
 const MAGIC = [0x53, 0x43, 0x31] // 'SC1'
 const FIXED_ONE = 65535 // 归一化坐标 / 笔宽的定点基数
 
+/**
+ * 单卡快照 magic（v4 墙容器 wallCodec.js 需要据此区分输入：
+ * 'SC1' = v3 起的单卡快照，可直接被 ScratchCard.restore 消费，
+ * 也可包进墙容器（见 migrateSingleToWall））。
+ */
+export function isSingleCardSnapshot(input) {
+  const bytes = input instanceof Uint8Array ? input : input instanceof ArrayBuffer ? new Uint8Array(input) : null
+  return !!bytes && bytes.length >= 4 && MAGIC.every((b, idx) => bytes[idx] === b)
+}
+
+/**
+ * 版本迁移分发表（v4 新增）。当前只有 v1（v3 定义）。
+ * 未来若新增快照版本：在此登记 { from, migrate(bytes)->v1-bytes }，
+ * decodeSnapshot 会先按旧版本号解码并迁移到当前版本——
+ * 墙冷存档「旧编码器生成的快照」与新代码共存（交织场景⑤）的官方
+ * 迁移路径就挂在这里；墙容器层迁移见 wallCodec.migrateSingleToWall。
+ */
+const SINGLE_MIGRATIONS = new Map()
+
+/** 注册旧版本 -> 当前版本（v1）的迁移器；供 wallCodec 等上层登记演示路径 */
+export function registerSnapshotMigration(fromVersion, migrateFn) {
+  if (typeof fromVersion !== 'number' || typeof migrateFn !== 'function') {
+    throw new Error('[scratch] 迁移器注册参数非法')
+  }
+  SINGLE_MIGRATIONS.set(fromVersion, migrateFn)
+}
+
+/** 读取单卡快照头里的版本号（不解析正文，非法输入返回 -1） */
+export function snapshotVersion(input) {
+  let bytes
+  if (input instanceof Uint8Array) bytes = input
+  else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input)
+  else return -1
+  if (bytes.length < 4 || !MAGIC.every((b, idx) => bytes[idx] === b)) return -1
+  return bytes[3]
+}
+
 /* ---------------- varint / zigzag（LEB128 小端） ---------------- */
 
 function writeVarint(writer, value) {
@@ -316,11 +353,21 @@ export function decodeSnapshot(input) {
   if (bytes.length < 5 || MAGIC.some((b, idx) => bytes[idx] !== b)) {
     throw new Error('[scratch] 快照 magic 不合法，不是刮刮卡存档')
   }
-  const reader = new ByteReader(bytes)
+  let reader = new ByteReader(bytes)
   MAGIC.forEach(() => reader.u8())
-  const version = reader.u8()
+  let version = reader.u8()
+  // 旧版本迁移：登记过的旧编码器快照先迁移到当前版本再按当前格式解码。
+  // bytes[3] 是版本字节；migrateFn 收到整个旧快照字节，产出当前版本字节。
   if (version !== SNAPSHOT_VERSION) {
-    throw new Error(`[scratch] 不支持的快照版本：${version}`)
+    const migrate = SINGLE_MIGRATIONS.get(version)
+    if (!migrate) throw new Error(`[scratch] 不支持的快照版本：${version}`)
+    bytes = migrate(bytes)
+    reader = new ByteReader(bytes)
+    MAGIC.forEach(() => reader.u8())
+    version = reader.u8()
+    if (version !== SNAPSHOT_VERSION) {
+      throw new Error(`[scratch] 快照迁移后版本仍非法：${version}`)
+    }
   }
 
   const cssWidth = reader.f32()

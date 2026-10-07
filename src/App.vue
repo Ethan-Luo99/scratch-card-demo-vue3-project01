@@ -1,209 +1,406 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
+import ScratchCardWall from './components/ScratchCardWall.vue'
 import ScratchCard from './components/ScratchCard.vue'
+import {
+  WALL_ARCHIVE_MAX_BYTES,
+  decodeWallArchive,
+  detectArchiveKind,
+  extractCardSnapshot,
+  migrateSingleToWall,
+} from './wallCodec.js'
 
-// 刮开面积百分比（0-100），由 ScratchCard 的 progress 事件实时更新
-const progress = ref(0)
-// 是否已刮达阈值并触发完成回调
-const finished = ref(false)
-const cardRef = ref(null)
+/* ================= 运营墙演示（v4） ================= */
 
-/* ---------- 运营面板：运行时换肤 / 调阈值 / 切换响应式 ---------- */
+const wallRef = ref(null)
+const cardCount = ref(24)
+const maxCards = ref(50)
+const budgetMB = ref(16)
+const coldMB = ref(8)
+const debugOverlay = ref(true)
 
-const coverText = ref('刮开查看奖品')
-const coverColor = ref('#b8bcc6')
-const threshold = ref(40)
-const responsive = ref(true)
+// 奖品卡槽内容（任意结构，经作用域插槽渲染；数量由 cardCount 驱动）
+const prizes = [
+  { name: '现金红包', value: '88 元', tone: '#c2410c' },
+  { name: '优惠券', value: '¥20', tone: '#2563eb' },
+  { name: '免单卡', value: '1 次', tone: '#0f766e' },
+  { name: '积分', value: '500', tone: '#7c3aed' },
+  { name: '神秘大奖', value: '???', tone: '#be185d' },
+]
+const cards = computed(() =>
+  Array.from({ length: cardCount.value }, (_, i) => ({
+    id: i,
+    ...prizes[i % prizes.length],
+  }))
+)
 
-const colorPresets = ['#b8bcc6', '#2563eb', '#c2410c', '#0f766e', '#7c3aed']
+/* ---------------- 墙状态轮询（调试面板展示） ---------------- */
 
-// 撤销/重做可用性：组件 expose 的 ref 经 proxyRefs 解包，直接读布尔值
-const canUndo = computed(() => cardRef.value?.canUndo ?? false)
-const canRedo = computed(() => cardRef.value?.canRedo ?? false)
+const totals = ref({
+  offline: 0,
+  cold: 0,
+  offlineBudget: budgetMB.value * 1024 * 1024,
+  coldBudget: coldMB.value * 1024 * 1024,
+  cards: 0,
+  active: 0,
+  sleeping: 0,
+  archived: 0,
+  discarded: 0,
+})
+const tickMs = ref(0)
+let pollTimer = 0
+function pollTotals() {
+  if (wallRef.value) totals.value = wallRef.value.getTotals()
+  tickMs.value++
+}
+pollTimer = window.setInterval(pollTotals, 600)
+onBeforeUnmount(() => clearInterval(pollTimer))
 
-// 演示把历史上限开大（默认 200），让 5000 笔压测时全部笔迹保持可撤销，
-// 从而真正走到「固化层」路径（rasterizeAfter=500 起固化）
-const maxHistory = ref(5000)
+const metaRows = computed(() => {
+  if (!wallRef.value) return []
+  return wallRef.value.getMeta().map((m, i) => ({ i, ...m }))
+})
 
-/* ---------- 存档 / 恢复 ---------- */
+function fmtKB(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + 'MB'
+  return (bytes / 1024).toFixed(1) + 'KB'
+}
 
-let snapshot = null
-const snapshotSize = ref(0)
-const snapshotError = ref('')
-const hasSnapshot = ref(false)
+/* ---------------- 调试操作 ---------------- */
 
-function handleSave() {
-  snapshotError.value = ''
+const seedIndex = ref(0)
+const seedCount = ref(300)
+const targetIndex = ref(0)
+const log = ref([])
+
+function pushLog(text) {
+  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+  log.value.unshift(`[${time}] ${text}`)
+  if (log.value.length > 12) log.value.pop()
+}
+
+function seedTarget() {
+  wallRef.value?.__seedAt(seedIndex.value, seedCount.value)
+  pushLog(`已向 #${seedIndex.value} 灌入 ${seedCount.value} 笔笔迹`)
+}
+
+function sleepTarget() {
+  wallRef.value?.__sleepAt(targetIndex.value)
+  pushLog(`强制休眠 #${targetIndex.value}`)
+}
+function wakeTarget() {
+  wallRef.value?.__wakeAt(targetIndex.value)
+  pushLog(`强制唤醒 #${targetIndex.value}`)
+}
+function archiveTarget() {
+  wallRef.value?.__archiveAt(targetIndex.value)
+  pushLog(`强制淘汰 #${targetIndex.value} → 冷存档池`)
+}
+
+let scrolling = false
+async function fastScroll() {
+  if (scrolling) return
+  scrolling = true
+  pushLog('开始模拟快速滚动…')
+  await wallRef.value?.__fastScroll(8)
+  scrolling = false
+  pushLog('快速滚动结束')
+}
+
+function onCardArchived(e) {
+  pushLog(`#${e.index} 笔迹转入冷档（${fmtKB(e.size)}）`)
+}
+function onCardDiscarded(e) {
+  pushLog(`#${e.index} 冷档超限被丢弃（${fmtKB(e.size)}）`)
+}
+function onCardConfigRestored(e) {
+  pushLog(`#${e.index} 覆盖配置随归档恢复（宿主可写回 cards）`)
+}
+
+/* ---------------- 批量存档 / 恢复 / 迁移演示 ---------------- */
+
+let wallArchive = null
+const wallArchiveSize = ref(0)
+const archiveError = ref('')
+
+function handleSaveAll() {
+  archiveError.value = ''
   try {
-    snapshot = cardRef.value?.save() ?? null
-    snapshotSize.value = snapshot ? snapshot.length : 0
-    hasSnapshot.value = !!snapshot
+    wallArchive = wallRef.value?.saveAll() ?? null
+    wallArchiveSize.value = wallArchive ? wallArchive.length : 0
+    pushLog(`saveAll 完成（${fmtKB(wallArchiveSize.value)}）`)
   } catch (err) {
-    snapshotError.value = err instanceof Error ? err.message : String(err)
+    archiveError.value = err instanceof Error ? err.message : String(err)
+    pushLog('saveAll 失败：' + archiveError.value)
   }
 }
 
-function handleRestore() {
-  if (!snapshot) return
-  snapshotError.value = ''
+async function handleWallRestore() {
+  if (!wallArchive) return
+  archiveError.value = ''
   try {
-    // restore 若恢复为完成态会同步 emit('finish') 重新置位，故先复位
-    finished.value = false
-    cardRef.value?.restore(snapshot)
+    const r = await wallRef.value?.wallRestore(wallArchive)
+    pushLog(
+      `整墙恢复：恢复 ${r.restored} 张 / 重置 ${r.reset} 张 / 裁剪 ${r.truncated} 张` +
+        (r.migrated === 'single' ? '（由单卡快照迁移）' : '')
+    )
   } catch (err) {
-    snapshotError.value = err instanceof Error ? err.message : String(err)
+    archiveError.value = err instanceof Error ? err.message : String(err)
+    pushLog('wallRestore 失败：' + archiveError.value)
   }
 }
 
-/* ---------- 调试：压测注入 ---------- */
-
-function seed(count) {
-  cardRef.value?.__debug.seed(count)
+/* v3 单卡 → wall 容器迁移演示（交织场景⑤） */
+const singleRef = ref(null)
+let singleSnapshot = null
+function saveSingleAndMigrate() {
+  archiveError.value = ''
+  try {
+    singleSnapshot = singleRef.value?.save() ?? null
+    if (!singleSnapshot) return
+    const wall1 = migrateSingleToWall(singleSnapshot)
+    const decoded = decodeWallArchive(wall1)
+    // 再验证：容器里的单卡段可被 ScratchCard.restore 单独恢复
+    const seg0 = extractCardSnapshot(wall1, 0)
+    const kind = detectArchiveKind(seg0)
+    pushLog(
+      `迁移演示：单卡 ${fmtKB(singleSnapshot.length)} → 墙容器 ${fmtKB(wall1.length)}` +
+        `（容量 ${decoded.capacity}，段类型 ${kind}，可单卡 restore）`
+    )
+    // 直接用迁移产物整墙恢复（恢复为 1 张有数据的墙 + 其余全新空卡）
+    wallRef.value?.wallRestore(wall1).then((r) => {
+      pushLog(`迁移产物 wallRestore：恢复 ${r.restored} / 重置 ${r.reset}`)
+    })
+  } catch (err) {
+    archiveError.value = err instanceof Error ? err.message : String(err)
+  }
 }
 
-function handleProgress(value) {
-  progress.value = value
+function dumpAnalysis() {
+  if (!wallArchive) {
+    pushLog('请先 saveAll')
+    return
+  }
+  const d = decodeWallArchive(wallArchive)
+  pushLog(
+    `归档分析：容量 ${d.capacity} / 段数 ${d.entries.length} / ` +
+      d.entries.map((e) => `#${e.index}${e.snapshot ? `(${fmtKB(e.snapshot.length)})` : '(配置)'})`).join(' ')
+  )
 }
 
-function handleFinish() {
-  finished.value = true
-}
-
-function handleReset() {
-  cardRef.value?.reset()
-  progress.value = 0
-  finished.value = false
+/* 单卡 v3 兼容区用到的响应式 */
+const singleProgress = ref(0)
+const singleFinished = ref(false)
+function onSingleProgress(v) {
+  singleProgress.value = v
 }
 </script>
 
 <template>
   <main class="page">
-    <h1 class="page__title">刮刮乐</h1>
+    <h1 class="page__title">刮刮卡 · 多卡运营墙 v4</h1>
     <p class="page__hint">
-      按住鼠标或手指拖动刮开涂层；支持撤销/重做、存档恢复；拖动窗口边缘、
-      缩放浏览器或切换下方开关，刮痕与进度都会保留
+      纵向滚动陈列最多 {{ maxCards }} 张卡；滚出视口自动休眠（释放 canvas backing
+      store），滚回 1 帧内恢复；离线状态超 LRU 预算转冷档，冷池超限丢弃最旧冷档。
     </p>
 
-    <!-- 卡片容器：宽度 min(92vw, 520px)，响应式模式下卡片撑满并自动跟随 -->
-    <div class="stage">
-      <ScratchCard
-        ref="cardRef"
-        class="stage__card"
-        :responsive="responsive"
-        :width="320"
-        :height="190"
-        :threshold="threshold"
-        :brush-size="30"
-        :cover-color="coverColor"
-        :cover-text="coverText"
-        :max-history="maxHistory"
-        :rasterize-after="500"
-        @progress="handleProgress"
-        @finish="handleFinish"
-      >
-        <!-- 底层中奖内容由默认插槽传入，可任意自定义 -->
-        <div class="prize">
-          <span class="prize__label">恭喜获得</span>
-          <strong class="prize__value">88 元</strong>
-          <span class="prize__name">现金红包</span>
-        </div>
-      </ScratchCard>
-    </div>
-
-    <p class="progress" :class="{ 'progress--done': finished }">
-      已刮开 {{ progress }}%
-      <template v-if="finished"> · 恭喜中奖 🎉</template>
-    </p>
-
-    <!-- 历史与存档工具条 -->
-    <div class="toolbar">
-      <button class="tool-btn" type="button" :disabled="!canUndo" @click="cardRef?.undo()">
-        撤销
-      </button>
-      <button class="tool-btn" type="button" :disabled="!canRedo" @click="cardRef?.redo()">
-        重做
-      </button>
-      <button class="tool-btn" type="button" @click="handleSave">存档</button>
-      <button class="tool-btn" type="button" :disabled="!hasSnapshot" @click="handleRestore">
-        恢复
-      </button>
-      <button class="reset-btn" type="button" @click="handleReset">重置</button>
-    </div>
-    <p v-if="hasSnapshot" class="snapshot-info">
-      快照 {{ (snapshotSize / 1024).toFixed(1) }} KB（内存中；持久化可存
-      IndexedDB，Uint8Array 可直接结构化克隆，无需 base64）
-    </p>
-    <p v-if="snapshotError" class="snapshot-error">{{ snapshotError }}</p>
-
-    <!-- 运营面板：所有修改运行时立即生效，不影响已有刮痕 -->
+    <!-- 内存总览 -->
     <section class="panel">
-      <h2 class="panel__title">运营面板</h2>
-
-      <label class="field">
-        <span class="field__label">涂层文案</span>
-        <input
-          v-model="coverText"
-          class="field__input"
-          type="text"
-          placeholder="留空则不显示文案"
-        />
-      </label>
-
-      <div class="field">
-        <span class="field__label">涂层底色</span>
-        <div class="field__colors">
-          <input
-            v-model="coverColor"
-            class="field__color"
-            type="color"
-            title="自定义颜色"
-          />
-          <button
-            v-for="color in colorPresets"
-            :key="color"
-            type="button"
-            class="swatch"
-            :class="{ 'swatch--active': coverColor === color }"
-            :style="{ background: color }"
-            :title="color"
-            @click="coverColor = color"
+      <div class="stat-row">
+        <div class="stat">
+          <span class="stat__label">在线 active</span>
+          <strong>{{ totals.active }}</strong>
+        </div>
+        <div class="stat stat--sleep">
+          <span class="stat__label">休眠 sleeping</span>
+          <strong>{{ totals.sleeping }}</strong>
+        </div>
+        <div class="stat stat--cold">
+          <span class="stat__label">冷档 archived</span>
+          <strong>{{ totals.archived }}</strong>
+        </div>
+        <div class="stat stat--discard">
+          <span class="stat__label">丢弃 discarded</span>
+          <strong>{{ totals.discarded }}</strong>
+        </div>
+      </div>
+      <div class="budget">
+        <label>
+          离线预算 {{ budgetMB }}MB · 已用
+          <b :class="{ over: totals.offline > totals.offlineBudget }">
+            {{ fmtKB(totals.offline) }}
+          </b>
+        </label>
+        <div class="budget__bar">
+          <div
+            class="budget__fill budget__fill--off"
+            :style="{ width: Math.min(100, (totals.offline / totals.offlineBudget) * 100) + '%' }"
           />
         </div>
       </div>
-
-      <label class="field">
-        <span class="field__label">完成阈值：{{ threshold }}%</span>
-        <input
-          v-model.number="threshold"
-          class="field__range"
-          type="range"
-          min="1"
-          max="100"
-        />
-      </label>
-
-      <label class="field field--switch">
-        <span class="field__label">响应式模式</span>
-        <input v-model="responsive" type="checkbox" class="field__checkbox" />
-        <span class="field__desc">
-          {{ responsive ? '宽度撑满容器，高宽比 16:9' : '固定 320 × 190' }}
-        </span>
-      </label>
+      <div class="budget">
+        <label>
+          冷存档池 {{ coldMB }}MB · 已用
+          <b :class="{ over: totals.cold > totals.coldBudget }">{{ fmtKB(totals.cold) }}</b>
+        </label>
+        <div class="budget__bar">
+          <div
+            class="budget__fill budget__fill--cold"
+            :style="{ width: Math.min(100, (totals.cold / totals.coldBudget) * 100) + '%' }"
+          />
+        </div>
+      </div>
     </section>
 
-    <!-- 调试面板：压测注入与重放计时 -->
-    <section class="panel panel--debug">
-      <h2 class="panel__title">调试面板</h2>
-      <div class="field">
-        <span class="field__label">压测注入</span>
-        <div class="debug-btns">
-          <button class="tool-btn" type="button" @click="seed(50)">注入 50 笔</button>
-          <button class="tool-btn" type="button" @click="seed(5000)">注入 5000 笔</button>
+    <!-- 运营墙 -->
+    <ScratchCardWall
+      ref="wallRef"
+      class="wall"
+      :cards="cards"
+      :max-cards="maxCards"
+      :wall-memory-budget="budgetMB * 1024 * 1024"
+      :cold-archive-budget="coldMB * 1024 * 1024"
+      :debug-overlay="debugOverlay"
+      :wall-height="'62vh'"
+      @card-archived="onCardArchived"
+      @card-discarded="onCardDiscarded"
+      @card-config-restored="onCardConfigRestored"
+    >
+      <template #default="{ card, index }">
+        <div class="prize" :style="{ background: `linear-gradient(160deg,#fff,#f1f5f9)`, color: card.tone }">
+          <span class="prize__idx">#{{ index }}</span>
+          <strong class="prize__value">{{ card.value }}</strong>
+          <span class="prize__name">{{ card.name }}</span>
         </div>
-        <span class="field__desc">
-          控制台执行 window.__SCRATCH_DEBUG__ = true 后拖动窗口边缘，
-          对比两种规模下的重放耗时日志（详见 README）
+      </template>
+    </ScratchCardWall>
+
+    <!-- 调试面板 -->
+    <section class="panel panel--debug">
+      <h2 class="panel__title">调试面板（验收辅助，__debug 非生产接口）</h2>
+
+      <div class="debug-grid">
+        <label class="field">
+          <span class="field__label">卡片数量（1-{{ maxCards }}）</span>
+          <input v-model.number="cardCount" type="range" min="1" :max="maxCards" />
+          <span class="field__desc">当前 {{ cardCount }} 张</span>
+        </label>
+        <label class="field">
+          <span class="field__label">离线预算 {{ budgetMB }} MB</span>
+          <input v-model.number="budgetMB" type="range" min="1" max="32" />
+          <span class="field__desc">调小到 1MB 滚动后即触发 LRU 淘汰</span>
+        </label>
+        <label class="field">
+          <span class="field__label">冷池预算 {{ coldMB }} MB</span>
+          <input v-model.number="coldMB" type="range" min="1" max="16" />
+          <span class="field__desc">继续淘汰使冷池超限即丢弃最旧冷档</span>
+        </label>
+        <label class="field field--switch">
+          <span class="field__label">状态徽标</span>
+          <input v-model="debugOverlay" type="checkbox" />
+        </label>
+      </div>
+
+      <div class="debug-grid">
+        <div class="field">
+          <span class="field__label">向指定卡灌入大量笔迹</span>
+          <div class="inline">
+            <label>#<input v-model.number="seedIndex" type="number" min="0" class="num" /></label>
+            <label>
+              <input v-model.number="seedCount" type="number" min="1" class="num" /> 笔
+            </label>
+            <button class="tool-btn" type="button" @click="seedTarget">灌入笔迹</button>
+          </div>
+        </div>
+        <div class="field">
+          <span class="field__label">模拟快速滚动</span>
+          <button class="tool-btn" type="button" :disabled="scrolling" @click="fastScroll">
+            {{ scrolling ? '滚动中…' : '往返快速滚动' }}
+          </button>
+        </div>
+        <div class="field">
+          <span class="field__label">强制休眠 / 唤醒 / 淘汰</span>
+          <div class="inline">
+            <label>#<input v-model.number="targetIndex" type="number" min="0" class="num" /></label>
+            <button class="tool-btn" type="button" @click="sleepTarget">休眠</button>
+            <button class="tool-btn" type="button" @click="wakeTarget">唤醒</button>
+            <button class="tool-btn tool-btn--warn" type="button" @click="archiveTarget">淘汰</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="debug-grid">
+        <div class="field">
+          <span class="field__label">整墙批量存档（≤ {{ (WALL_ARCHIVE_MAX_BYTES / 1024 / 1024).toFixed(0) }}MB）</span>
+          <div class="inline">
+            <button class="tool-btn" type="button" @click="handleSaveAll">wall.saveAll()</button>
+            <button class="tool-btn" type="button" :disabled="!wallArchive" @click="handleWallRestore">
+              wallRestore
+            </button>
+            <button class="tool-btn" type="button" :disabled="!wallArchive" @click="dumpAnalysis">
+              解析归档
+            </button>
+            <span v-if="wallArchive" class="field__desc">{{ fmtKB(wallArchiveSize) }}</span>
+          </div>
+        </div>
+        <div class="field">
+          <span class="field__label">v3 单卡快照 → wall 容器迁移（场景⑤）</span>
+          <div class="inline">
+            <button class="tool-btn" type="button" @click="saveSingleAndMigrate">
+              存下方案例单卡并迁移/恢复
+            </button>
+          </div>
+          <span class="field__desc">
+            先在下方「单卡兼容区」刮几笔；迁移后整墙 #0 恢复为该卡，其余回出厂态
+          </span>
+        </div>
+      </div>
+      <p v-if="archiveError" class="snapshot-error">{{ archiveError }}</p>
+    </section>
+
+    <!-- 每卡状态表 -->
+    <section class="panel">
+      <h2 class="panel__title">每卡状态与内存量级（{{ metaRows.length }}）</h2>
+      <div class="chip-grid">
+        <span
+          v-for="row in metaRows"
+          :key="row.i"
+          class="chip"
+          :data-state="row.state"
+          :title="`#${row.i} ${row.state} 离线 ${fmtKB(row.offline)} 冷档 ${fmtKB(row.coldBytes)} 进度 ${row.progress}%`"
+        >
+          {{ row.i }}:{{ row.state.slice(0, 4) }}
         </span>
+      </div>
+    </section>
+
+    <!-- 事件日志 -->
+    <section class="panel">
+      <h2 class="panel__title">淘汰 / 恢复事件日志</h2>
+      <ul class="log">
+        <li v-for="(line, i) in log" :key="i">{{ line }}</li>
+        <li v-if="!log.length" class="log__empty">（操作后在此输出 onCardArchived / onCardDiscarded 等事件）</li>
+      </ul>
+    </section>
+
+    <!-- v3 单卡兼容区：证明对外接口未破坏，且单卡快照可迁移 -->
+    <section class="panel">
+      <h2 class="panel__title">v3 单卡兼容区（接口未改动 / 单卡快照来源）</h2>
+      <div class="single-wrap">
+        <ScratchCard
+          ref="singleRef"
+          :width="300"
+          :height="168"
+          :max-history="5000"
+          @progress="onSingleProgress"
+          @finish="singleFinished = true"
+        >
+          <div class="prize prize--mini">
+            <strong>88 元</strong>
+            <span>迁移用红包</span>
+          </div>
+        </ScratchCard>
+        <span class="field__desc">已刮开 {{ singleProgress }}%{{ singleFinished ? ' · 已完成' : '' }}</span>
       </div>
     </section>
   </main>
@@ -214,41 +411,245 @@ function handleReset() {
   min-height: 100svh;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 18px;
-  padding: 24px;
+  gap: 14px;
+  padding: 20px;
   box-sizing: border-box;
+  max-width: 1100px;
+  margin: 0 auto;
 }
 
 .page__title {
   margin: 0;
-  font-size: 30px;
+  font-size: 26px;
   font-weight: 700;
-  letter-spacing: 2px;
-  color: #2b2f38;
+  color: #1f2937;
 }
 
 .page__hint {
-  margin: 0 0 6px;
-  max-width: 520px;
-  font-size: 14px;
+  margin: 0;
+  font-size: 13px;
   line-height: 1.6;
-  text-align: center;
-  color: #8a909c;
+  color: #6b7280;
 }
 
-/* 卡片容器：宽度 = min(92vw, 520px) */
-.stage {
-  width: min(92vw, 520px);
+.wall {
+  flex: none;
+}
+
+.panel {
+  padding: 14px 16px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
 }
 
-/* 卡片自身内联样式决定宽度（响应式 100% / 固定 320px），
-   这里只兜底不超出容器，固定尺寸时由 stage 居中 */
-.stage__card {
-  max-width: 100%;
+.panel--debug {
+  border-style: dashed;
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #6b7280;
+  letter-spacing: 1px;
+}
+
+.stat-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.stat {
+  flex: 1 1 110px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #ecfdf5;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat strong {
+  font-size: 22px;
+  color: #065f46;
+}
+
+.stat--sleep {
+  background: #eff6ff;
+}
+.stat--sleep strong {
+  color: #1d4ed8;
+}
+.stat--cold {
+  background: #f5f3ff;
+}
+.stat--cold strong {
+  color: #6d28d9;
+}
+.stat--discard {
+  background: #fef2f2;
+}
+.stat--discard strong {
+  color: #b91c1c;
+}
+
+.stat__label {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.budget label {
+  font-size: 12px;
+  color: #4b5563;
+}
+
+.budget b {
+  font-variant-numeric: tabular-nums;
+}
+
+.budget b.over {
+  color: #dc2626;
+}
+
+.budget__bar {
+  margin-top: 4px;
+  height: 8px;
+  border-radius: 999px;
+  background: #e5e7eb;
+  overflow: hidden;
+}
+
+.budget__fill {
+  height: 100%;
+  transition: width 0.25s ease;
+}
+
+.budget__fill--off {
+  background: #2563eb;
+}
+
+.budget__fill--cold {
+  background: #7c3aed;
+}
+
+.debug-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px 18px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: #374151;
+}
+
+.field--switch {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.field__label {
+  font-weight: 500;
+}
+
+.field__desc {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.num {
+  width: 64px;
+  padding: 5px 6px;
+  font-size: 13px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+}
+
+.tool-btn {
+  padding: 7px 14px;
+  font-size: 13px;
+  color: #2563eb;
+  background: #fff;
+  border: 1px solid #2563eb;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.tool-btn:disabled {
+  color: #9ca3af;
+  border-color: #d1d5db;
+  cursor: not-allowed;
+}
+
+.tool-btn--warn {
+  color: #b91c1c;
+  border-color: #b91c1c;
+}
+
+.snapshot-error {
+  margin: 0;
+  font-size: 13px;
+  color: #dc2626;
+}
+
+.chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  border-radius: 999px;
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.chip[data-state='sleeping'] {
+  background: #dbeafe;
+  color: #1e40af;
+}
+.chip[data-state='archived'] {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+.chip[data-state='discarded'] {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.log {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #4b5563;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.log__empty {
+  color: #9ca3af;
+  list-style: none;
+  margin-left: -18px;
 }
 
 .prize {
@@ -258,209 +659,36 @@ function handleReset() {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  color: #c2410c;
-  background: linear-gradient(160deg, #fff7ed 0%, #ffedd5 100%);
+  gap: 2px;
 }
 
-.prize__label {
-  font-size: 14px;
-  color: #9a3412;
+.prize__idx {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  font-size: 11px;
+  color: #9ca3af;
 }
 
 .prize__value {
-  font-size: 44px;
-  line-height: 1.1;
+  font-size: 30px;
   font-weight: 800;
 }
 
 .prize__name {
-  font-size: 15px;
-  color: #9a3412;
+  font-size: 13px;
 }
 
-.progress {
-  margin: 6px 0 0;
-  font-size: 15px;
-  font-variant-numeric: tabular-nums;
-  color: #4b5563;
-}
-
-.progress--done {
+.prize--mini {
+  gap: 4px;
   color: #c2410c;
-  font-weight: 600;
+  background: linear-gradient(160deg, #fff7ed, #ffedd5);
 }
 
-/* ---------- 工具条 ---------- */
-
-.toolbar {
+.single-wrap {
   display: flex;
-  gap: 10px;
+  align-items: center;
+  gap: 16px;
   flex-wrap: wrap;
-  justify-content: center;
-}
-
-.tool-btn {
-  padding: 9px 22px;
-  font-size: 15px;
-  color: #2563eb;
-  background: #fff;
-  border: 1px solid #2563eb;
-  border-radius: 999px;
-  cursor: pointer;
-  transition: background-color 0.2s, transform 0.1s;
-}
-
-.tool-btn:hover:not(:disabled) {
-  background: #eff6ff;
-}
-
-.tool-btn:disabled {
-  color: #9ca3af;
-  border-color: #d1d5db;
-  cursor: not-allowed;
-}
-
-.tool-btn:active:not(:disabled) {
-  transform: scale(0.96);
-}
-
-.reset-btn {
-  padding: 9px 34px;
-  font-size: 15px;
-  color: #fff;
-  background: #2563eb;
-  border: none;
-  border-radius: 999px;
-  cursor: pointer;
-  transition: background-color 0.2s, transform 0.1s;
-}
-
-.reset-btn:hover {
-  background: #1d4ed8;
-}
-
-.reset-btn:active {
-  transform: scale(0.96);
-}
-
-.snapshot-info {
-  margin: 0;
-  font-size: 13px;
-  color: #6b7280;
-}
-
-.snapshot-error {
-  margin: 0;
-  font-size: 13px;
-  color: #dc2626;
-}
-
-/* ---------- 运营面板 ---------- */
-
-.panel {
-  width: min(92vw, 520px);
-  margin-top: 6px;
-  padding: 18px 20px;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 14px 20px;
-  background: #fff;
-  border: 1px solid #e5e7eb;
-  border-radius: 12px;
-  box-sizing: border-box;
-}
-
-.panel--debug {
-  border-style: dashed;
-}
-
-.panel__title {
-  grid-column: 1 / -1;
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-  color: #6b7280;
-  letter-spacing: 1px;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  font-size: 14px;
-  color: #374151;
-}
-
-.field__label {
-  font-weight: 500;
-}
-
-.field__input {
-  padding: 8px 10px;
-  font-size: 14px;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
-  outline: none;
-}
-
-.field__input:focus {
-  border-color: #2563eb;
-}
-
-.field__colors {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.field__color {
-  width: 36px;
-  height: 28px;
-  padding: 0;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  background: none;
-  cursor: pointer;
-}
-
-.swatch {
-  width: 24px;
-  height: 24px;
-  border: 2px solid transparent;
-  border-radius: 50%;
-  cursor: pointer;
-  transition: transform 0.1s;
-}
-
-.swatch--active {
-  border-color: #111827;
-  transform: scale(1.1);
-}
-
-.field__range {
-  accent-color: #2563eb;
-}
-
-.field--switch {
-  flex-direction: row;
-  align-items: center;
-  gap: 10px;
-}
-
-.field__checkbox {
-  width: 18px;
-  height: 18px;
-  accent-color: #2563eb;
-}
-
-.field__desc {
-  font-size: 13px;
-  color: #8a909c;
-}
-
-.debug-btns {
-  display: flex;
-  gap: 10px;
 }
 </style>

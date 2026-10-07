@@ -149,3 +149,134 @@ redo 恢复的是几何而非外观，因此 redo 栈原样保留（注释见组
 - 快速甩动粗线段连接 + `getCoalescedEvents()` 补点，笔迹连续；
 - ResizeObserver + matchMedia(resolution) 监听尺寸/DPR，rAF 合并重建；
 - `visibilitychange` 清理悬挂指针状态。
+
+---
+
+# v4：多卡运营墙（ScratchCardWall）
+
+在 v3 单卡能力（接口全部保留、仅新增）之上新增「多卡运营墙」：一张页面
+纵向滚动陈列最多 `maxCards`（默认 50）张刮刮卡，长时间挂机下控制总内存
+与滚动流畅度。**不引入任何运行时依赖。**
+
+## 运行
+
+```bash
+npm run dev      # 打开演示页即「运营墙 + 调试面板」
+```
+
+## 新增文件 / 改动
+
+- `src/components/ScratchCardWall.vue`：墙组件（视口感知、LRU、冷池、批量存档）
+- `src/wallCodec.js`：整墙容器格式 `SCWL` + v3 单卡 → 墙容器迁移
+- `src/scratchCodec.js`：仅新增（magic 识别、版本号读取、迁移分发表）
+- `src/components/ScratchCard.vue`：仅新增休眠/离屏接口（见下），v3 语义不变
+- `src/App.vue`：v4 运营墙演示 + 调试面板
+
+## ScratchCard v4 新增暴露（v3 接口一字未改）
+
+`sleep()` / `wake()` / `isSleeping()` / `serializeOffline()` /
+`restoreOffline(snapshot)` / `clearStateOffline()` / `memoryStats()` /
+`hasContent()`；新增事件 `interact`（真实刮擦 pointerdown 时派发）。
+`save()`/`restore()` 本身也已休眠感知（休眠卡 save 走离屏序列化、
+restore 自动回在线态）。
+
+墙给每卡传入新增的 `initSleeping` prop：所有卡槽**挂载时即为休眠态**，
+离屏卡从一开始就不分配主 canvas backing store（避免 50 张卡首帧同时
+分配的一次性显存峰值）；卡槽上另有一个与涂层同色的纯 CSS 占位层
+（`.scratch-wall__cover`，`pointer-events:none`）遮盖尚未建立涂层时的
+底层奖品，卡片一进入视口与 `wake()` 同帧移除。该 prop 默认 false，
+v3 单独使用 ScratchCard 时行为不变。
+
+**休眠释放口径**：`sleep()` 释放主显示 canvas 的 backing store 与
+`solidMask`（都可确定性重建），保留归一化矢量时间线（slots/undo/redo/
+blocks）与 `frozenMask` 永久层位图（无矢量来源，不可重建）。`wake()` 在
+一次同步调用内完成「永久层尺寸/DPR 迁移 + solid 层矢量重栅格化 + 分层
+重放 + 进度复测」，调用返回时画面已完整——滚回视口同帧恢复。
+
+## 三级状态与内存预算（公式见组件文件头注释）
+
+- `active` 视口内；`sleeping` 滚出视口（释放两个 backing store，驻留
+  矢量 + 永久层）；`archived` LRU 淘汰（只剩冷池里的 save() 快照）；
+  `discarded` 冷池再超限丢弃（滚回为全新空卡）。
+- 离线预算 `wallMemoryBudget`（默认 **16MB**）：
+  `S = Σ_sleeping ( points×16 + slots×80 + frozenW×frozenH×4 )`，
+  即矢量驻留保守上界 + 永久层 RGBA 字节；**主画布与 solidMask 不计入**
+  （休眠后保证为 0）。
+- 冷池预算 `coldArchiveBudget`（默认 **8MB**）：`Σ 冷档快照精确字节`。
+- LRU：真实刮擦（`interact`）刷新时间；仅在 sleeping 卡中选最久未交互者
+  淘汰；冷池超限按入池次序 FIFO 丢弃，触发 `onCardArchived` /
+  `onCardDiscarded`。
+
+## 整墙归档格式（wallCodec.js，硬上限 8MB）
+
+`SCWL` 信封内每段 payload 原样就是 v3 `SC1` 单卡快照：
+
+- `wall.saveAll()` → 单一 `Uint8Array`（稀疏：空卡不出段），> 8MB 抛错；
+- `wall.wallRestore(archive)` 异步分帧（每帧 6 张，不卡滚动），同时接受
+  墙归档与 **v3 单卡快照**（自动 `migrateSingleToWall` 迁移成容量 1 的墙）；
+- `extractCardSnapshot(archive, i)` 零拷贝取出单卡段，可直接
+  `ScratchCard.restore(seg)` 单独恢复；
+- 卡数不一致语义：段下标超出现有卡槽 → **裁剪忽略**并在返回值
+  `truncated` 告知（墙不能凭空造出品卡槽位，静默裁剪优于整包失败）；
+  现有卡槽多于归档段 → 未覆盖卡槽**重置为全新空卡**（restore 即
+  「墙变回归档时的样子」，避免半新半旧）。理由写在 wallRestore 注释里。
+
+## 交织场景的处理（全部在代码注释中有取舍说明）
+
+1. **多指刮擦中滚出视口**：`sleep()` 把每个进行中笔迹先确认入撤销栈
+   （不丢、不等真实 pointerup），随后的 pointerup/cancel 幂等空转；
+2. **滚动中 saveAll**：序列化全程同步不 await，IO 回调无法插入，50 张卡
+   取到的是同一时刻一致状态；
+3. **冷档淘汰与 undo 跨固化边界同帧**：JS 单线程顺序执行，淘汰序列化前
+   先冲刷该卡维护（evict 烘永久层 / solid 仅标脏），快照必为落地后状态；
+4. **批量恢复中 DPR 变化**：几何以归一化坐标 + alpha 网格存储、与 DPR
+   无关；每张卡在实际恢复的那一帧才读尺寸——在线卡用当时 DPR 重建，
+   离屏卡只装矢量、wake 时再按最新 DPR 栅格化；
+5. **旧编码器冷档**：单卡版本迁移挂在 `registerSnapshotMigration`
+   分发表，容器版本挂 `registerWallMigration`；演示路径
+   `migrateSingleToWall` 实现 v3 单卡 → wall 容器。
+
+redo 栈在休眠/淘汰/恢复后的语义不变（随矢量/快照完整保留；仅刮新一笔
+或 reset 清空）。
+
+## 验收 / 手工验证清单（演示页操作）
+
+准备：`npm run dev`，页面从上到下为「内存总览 → 墙 → 调试面板 →
+每卡状态表 → 事件日志 → v3 单卡兼容区」。徽标颜色：绿=active、
+蓝=sleeping、紫=archived、红=discarded。
+
+1. **休眠释放与 1 帧恢复**：刮几张卡 → 向下滚动 → 观察徽标变
+   `sleeping`（内存总览「休眠」计数上升、离线已用变化）；快速滚回，
+   刮痕与进度完整、无空白帧。控制台可配合 `window.__SCRATCH_DEBUG__=true`
+   看 wake 重放耗时日志（墙内为小卡，通常亚毫秒）。
+2. **休眠后 resize / DPR 无损**：让卡休眠后拖动窗口宽度 / 跨屏改变 DPR，
+   再滚回——刮痕按新尺寸正确重放；恢复后连点「撤销」跨固化边界
+   （先灌 3000+ 笔形成固化层）仍然逐笔正确。
+3. **场景①多指刮擦滚走**：在某卡上按住拖动（多指）不松手直接滚动页面，
+   该卡滚出视口后松手，再滚回——进行中笔迹已作为最后一笔保留，可撤销。
+4. **强制 LRU 淘汰**：调试面板把「离线预算」滑到 1MB，向若干卡
+   「灌入笔迹」后滚动使其休眠，观察状态变 `archived`、事件日志输出
+   `cardArchived`、冷池用量上升；把冷池预算也调小（如 1MB）继续淘汰，
+   最旧冷档变 `discarded`（日志 `cardDiscarded`）。
+5. **冷档滚回恢复**：被淘汰卡滚回视口时徽标先紫后绿，刮痕完整恢复；
+   被丢弃卡滚回为全新空卡。
+6. **场景②滚动中 saveAll**：点「往返快速滚动」后立刻（或滚动期间多点
+   几次）`wall.saveAll()`，再 `wallRestore`，整墙刮痕一致；「解析归档」
+   可查看容量/段数/每段字节。
+7. **批量恢复 + 场景④ DPR**：`saveAll` 后点 `wallRestore`，恢复动画
+   分帧进行（观察徽标分批变绿）；恢复进行中拖动窗口改变宽度，恢复结束
+   后滚动检查各卡刮痕与尺寸均正确。
+8. **场景⑤旧格式迁移**：在「v3 单卡兼容区」刮几笔，点
+   「存下方案例单卡并迁移/恢复」——日志显示 `SC1 → SCWL` 容量 1、
+   段类型 `single`（可直接单卡 restore），整墙 #0 恢复为该卡、其余卡槽
+   回出厂态。也可用控制台：
+   ```js
+   const seg = extractCardSnapshot(archive, 0) // 从零拷贝取 #0 段
+   singleCardRef.restore(seg) // 墙内单卡段可被 v3 接口单独恢复
+   ```
+9. **卡数裁剪语义**：`saveAll` 后把「卡片数量」调小/调大再 `wallRestore`：
+   多出的段被裁剪（返回值 `truncated`，日志可见），不足的卡槽回空卡。
+10. **8MB 上限**：持续大量灌笔使归档逼近上限时，`saveAll` 抛明确错误且
+    不产生截断数据（错误显示在调试面板）。
+11. **v3 兼容**：页面底部单卡兼容区验证旧 props/事件/`undo/redo/save/
+    restore/reset/__debug.seed` 全部照常工作。

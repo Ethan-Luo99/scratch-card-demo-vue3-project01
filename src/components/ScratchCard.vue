@@ -51,6 +51,26 @@ import { encodeSnapshot, decodeSnapshot } from '../scratchCodec.js'
  * 换肤只重绘涂层外观，不触碰任何笔迹几何（slots/遮罩都不变），redo
  * 恢复的是几何而非外观，因此 redo 栈原样保留、canRedo 不变。唯一会
  * 清空 redo 栈的动作是「刮出新的一笔」（编辑器标准语义）与 reset。
+ *
+ * ------------------------------------------------------------------
+ * v4 新增：休眠 / 离屏状态（多卡运营墙，接口仅新增不改语义）
+ * ------------------------------------------------------------------
+ * sleep()：滚出视口时调用。进行中的多指笔迹先按「确认」入撤销栈
+ * （不丢笔迹、不等待真实 pointerup），冲刷挂起维护后释放：
+ *   - 显示用主 canvas 的 backing store（canvas.width/height 置 0）
+ *   - solidMask 可重建层位图（矢量全部在册，wake 从矢量重栅格化）
+ * 保留：slots/undoStack/redoStack/blocks 全部矢量与标志、frozenMask
+ * 永久层位图（无矢量来源，丢了无法恢复，只能随状态保留）。
+ * wake()：滚回视口时一次同步 rebuildCanvas(true) 内完成 frozen 层
+ * 尺寸/DPR 迁移 + solid 层矢量重栅格化 + 全量分层重放 + 进度复测，
+ * 在调用返回前画面已完整——满足「1 帧内恢复」。
+ * 休眠期间 resize/DPR 变化只做离屏 frozen 层迁移与尺寸记录，绝不
+ * 重新分配主 backing store（否则休眠失去意义）；矢量是归一化的，
+ * solid 层等 wake 时按新尺寸重建，因此 resize、DPR 变化、undo 跨
+ * 固化边界在休眠/恢复后仍逐像素正确（同 v3 的既有不变量）。
+ * 另有 serializeOffline()（休眠卡存档，不碰主 canvas）、
+ * restoreOffline()（直接恢复成休眠态，供墙批量恢复离屏卡）、
+ * clearStateOffline()（离线重置）、memoryStats()（预算计量）。
  */
 
 const props = defineProps({
@@ -85,9 +105,19 @@ const props = defineProps({
    * 历史上限丢进永久层）；演示页把 maxHistory 调到 5000 即可观察。
    */
   rasterizeAfter: { type: Number, default: 500 },
+  /**
+   * v4 新增：挂载后立即进入休眠态（不分配主 canvas backing store）。
+   * 仅供运营墙使用——墙内离屏卡槽创建时就该零显存，无需先完整渲染
+   * 一帧再被 IO 回调释放（那会让 50 张卡同时产生一次性显存峰值）。
+   * 尺寸/DPR 只记录不渲染；滚入视口经 wake() 同帧恢复。默认 false，
+   * v3 单独使用 ScratchCard 的行为完全不变。
+   */
+  initSleeping: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['progress', 'finish'])
+// v4 新增 'interact'：真实刮擦开始（pointerdown）时派发，
+// 供运营墙刷新 LRU「最近交互」时间；v3 的 progress/finish 语义不变。
+const emit = defineEmits(['progress', 'finish', 'interact'])
 
 const rootRef = ref(null)
 const canvasRef = ref(null)
@@ -101,6 +131,15 @@ let dpr = 1
 let cssWidth = 0
 let cssHeight = 0
 let initialized = false
+/**
+ * v4 休眠标志（见文件头 v4 说明）。休眠期间：
+ * - 主 canvas backing store 已释放（ctx 为 null），repaint 直接空转；
+ * - scheduleMaintenance / scheduleMeasure 不挂任何 rAF/定时器
+ *   （几何维护推迟到 wake，由 rebuildCanvas(true) 统一完成）；
+ * - rebuildCanvas 走「离屏分支」：只迁移 frozenMask、记录尺寸/DPR；
+ * - 指针事件一律忽略（滚出视口的卡不可能被真实点按）。
+ */
+let sleeping = false
 
 /** 是否已经完成（达到阈值，正在/已经淡出）；完成后 undo/redo 禁用 */
 let finished = false
@@ -321,6 +360,33 @@ function rebuildCanvas(force = false) {
   if (rect.width <= 0 || rect.height <= 0) return
   const nextDpr = Math.min(window.devicePixelRatio || 1, 3)
 
+  // v4 休眠离屏分支：绝不重新分配主 backing store（休眠的全部意义）。
+  // 只更新记录的尺寸/DPR，并把无矢量来源的 frozenMask 做一次等比缩放，
+  // 这样「休眠期间跨屏 DPR 变化」也不丢永久层；solidMask 此刻不存在
+  // （sleep 时已随主画布一起释放），其矢量是归一化坐标，wake 时按新
+  // 尺寸重栅格化即可，天然无缩放模糊。进行中笔迹在 sleep 时已确认入栈。
+  if (sleeping) {
+    const sizeChanged =
+      nextDpr !== dpr ||
+      Math.abs(rect.width - cssWidth) >= 0.5 ||
+      Math.abs(rect.height - cssHeight) >= 0.5
+    cssWidth = rect.width
+    cssHeight = rect.height
+    dpr = nextDpr
+    initialized = true
+    if (sizeChanged) {
+      // frozenBaseGrid（离线恢复注入的永久层网格）保持原样不动：
+      // wake 的 migrateMasks 会优先消费它，且按当时最新尺寸缩放；
+      // 只有「旧位图存在且无注入网格」时才需要在这里迁移旧位图。
+      if (!frozenBaseGrid && frozenMask) {
+        const scaled = scaleMask(frozenMask)
+        frozenMask = scaled.canvas
+        frozenCtx = scaled.ctx
+      }
+    }
+    return
+  }
+
   if (
     !force &&
     initialized &&
@@ -431,7 +497,9 @@ function drawStrokeOnMask(maskCtx, stroke) {
  * 因此重放耗时与历史总笔数解耦（5000 笔 ≈ 50 笔）。
  */
 function repaint() {
-  if (!ctx) return
+  // v4：休眠后主 canvas backing store 已释放（ctx=null），空转即可；
+  // 所有几何状态仍由 slots/遮罩保留，wake 的 rebuildCanvas 会完整重放。
+  if (!ctx || sleeping) return
   const timing = debugEnabled()
   const t0 = timing ? performance.now() : 0
 
@@ -471,6 +539,8 @@ function syncFlags() {
  * 标志位合并保证每帧至多：一次 solidMask 重建 + 一次重放 + 一次测量。
  */
 function scheduleMaintenance() {
+  // 休眠期不挂 rAF：sleep() 内部已同步冲刷维护，唤醒时强制重建兜底
+  if (sleeping) return
   if (maintenanceRaf) return
   maintenanceRaf = requestAnimationFrame(() => {
     maintenanceRaf = 0
@@ -479,7 +549,9 @@ function scheduleMaintenance() {
 }
 
 function runMaintenance() {
-  if (!initialized) return
+  // 休眠期几何维护全部挂起（evict 需要 frozenMask 离屏绘制，
+  // serializeOffline 会在真正需要时同步驱动一轮，见该函数注释）
+  if (!initialized || sleeping) return
   // 1) 丢弃超出 maxHistory 的最旧笔画（可能标 solidDirty，须先于重建）
   const limit = Math.max(1, Math.floor(props.maxHistory))
   while (undoStack.length > limit) evictOldest()
@@ -639,7 +711,7 @@ function recordPoint(slot, point) {
 }
 
 function onPointerDown(event) {
-  if (finished) return
+  if (finished || sleeping) return
   event.preventDefault()
   event.currentTarget.setPointerCapture(event.pointerId)
   // 新一笔刮擦解除 restore/压测的 finish 抑制：此后测量达阈值正常完成
@@ -659,13 +731,15 @@ function onPointerDown(event) {
   recordPoint(slot, point)
   activePointers.set(event.pointerId, { prev: point, slot })
   scratchSegment(point.x, point.y, point.x, point.y)
+  // v4：真实刮擦开始，通知墙刷新 LRU「最近交互」时间
+  emit('interact', { at: performance.now() })
   scheduleMeasure(true)
   syncFlags()
 }
 
 function onPointerMove(event) {
   const active = activePointers.get(event.pointerId)
-  if (finished || !active) return
+  if (finished || sleeping || !active) return
   event.preventDefault()
 
   const coalesced =
@@ -700,7 +774,7 @@ function onPointerUp(event) {
 /* ================= 进度统计（沿用 v2：节流 + 降采样） ================= */
 
 function scheduleMeasure(immediate = false) {
-  if (finished) return
+  if (finished || sleeping) return
   const now = performance.now()
   if (!immediate && now - lastMeasureAt < MEASURE_INTERVAL) {
     if (!sampleTimer) {
@@ -720,7 +794,7 @@ function scheduleMeasure(immediate = false) {
 
 function measureProgress() {
   lastMeasureAt = performance.now()
-  if (!sampleCtx || finished) return
+  if (!sampleCtx || finished || sleeping) return
 
   sampleCtx.clearRect(0, 0, sampleCols, sampleRows)
   sampleCtx.drawImage(canvasRef.value, 0, 0, sampleCols, sampleRows)
@@ -818,6 +892,7 @@ function reset() {
   activePointers.clear()
   clearHistoryState()
   suppressFinish = false
+  sleeping = false // v4：无论此前是否休眠/冷档淘汰，reset 后回到在线全新卡
   if (sampleTimer) {
     clearTimeout(sampleTimer)
     sampleTimer = 0
@@ -880,27 +955,36 @@ function gridToCanvas(grid) {
 }
 
 /**
+ * v4：把 gridToCanvas 产出的「alpha 网格画布」读回网格（仅
+ * encodeCurrentState 在 frozenBaseGrid 尚未被 wake 消费时使用）。
+ * 该画布的 RGB 恒 0、仅 alpha 有意义；网格最长边受
+ * MASK_SAVE_MAX_DIM 约束，直接读取即可。
+ */
+function alphaCanvasToGrid(canvas) {
+  if (!canvas) return null
+  const cols = canvas.width
+  const rows = canvas.height
+  const g2d = canvas.getContext('2d', { willReadFrequently: true })
+  const { data } = g2d.getImageData(0, 0, cols, rows)
+  const alpha = new Uint8Array(cols * rows)
+  for (let i = 0, j = 3; i < alpha.length; i++, j += 4) alpha[i] = data[j]
+  return { cell: Math.max(1, Math.round(cssWidth / cols)), cols, rows, alpha }
+}
+
+/**
  * 对外暴露：导出可序列化快照（Uint8Array，<= 2MB，超出抛错）。
  * 内容是「全部在册笔迹矢量 + 永久固化层位图 + 进度」，不含涂层外观
  * （换肤状态由调用方自己持有）。固化层（solidMask）不存位图：其矢量
  * 全部在册，restore 时重栅格化即可，比重采样位图更精确。
  *
- * 边界场景⑤：save 发生在 rAF 重建/维护挂起期间——先把挂起的
- * rebuild 与 maintenance 同步冲刷掉，保证快照是最终一致状态。
+ * 边界场景（v3 ⑤ / v4 墙场景②）：save / saveAll 发生在 rAF
+ * 重建/维护挂起或快速滚动期间——先把挂起的 rebuild 与 maintenance
+ * 同步冲刷掉（休眠卡走 serializeOffline，不触碰已释放的主画布），
+ * 保证快照是最终一致状态；JS 单线程下序列化期间滚动回调无法插入，
+ * saveAll 对 50 张卡看到的必是同一份一致状态。
  */
-function save() {
-  if (!initialized) throw new Error('[scratch] 组件尚未初始化，无法存档')
-  if (rebuildRaf) {
-    cancelAnimationFrame(rebuildRaf)
-    rebuildRaf = 0
-    rebuildCanvas()
-  }
-  if (maintenanceRaf) {
-    cancelAnimationFrame(maintenanceRaf)
-    maintenanceRaf = 0
-    runMaintenance()
-  }
-
+/** 由当前时间线状态编码单卡快照（save 与 serializeOffline 共用） */
+function encodeCurrentState() {
   const strokes = slots.map((slot, index) => ({
     i: index,
     w: slot.w,
@@ -917,7 +1001,6 @@ function save() {
     const index = slotIndexById.get(id)
     if (index !== undefined) redo.push(index)
   }
-
   return encodeSnapshot({
     cssWidth,
     cssHeight,
@@ -927,9 +1010,35 @@ function save() {
     strokes,
     solidTo,
     solid: null,
-    perm: frozenDirty && frozenMask ? maskToGrid(frozenMask) : null,
+    // 交织边界：离屏恢复注入的 frozenBaseGrid 可能尚未被 wake 消费成
+    // frozenMask（restoreOffline 后未滚回视口就再次被淘汰进冷档）。
+    // 两者择一取永久层来源，保证这条路径上的永久层不丢；frozenBaseGrid
+    // 本身就是「alpha 网格画布」（gridToCanvas 产物），直接读 alpha 通道。
+    perm: frozenDirty
+      ? frozenMask
+        ? maskToGrid(frozenMask)
+        : alphaCanvasToGrid(frozenBaseGrid)
+      : null,
     redo,
   })
+}
+
+function save() {
+  if (!initialized) throw new Error('[scratch] 组件尚未初始化，无法存档')
+  // 休眠卡主画布已释放：走离屏序列化（语义与 save 完全一致）
+  if (sleeping) return serializeOffline()
+  if (rebuildRaf) {
+    cancelAnimationFrame(rebuildRaf)
+    rebuildRaf = 0
+    rebuildCanvas()
+  }
+  if (maintenanceRaf) {
+    cancelAnimationFrame(maintenanceRaf)
+    maintenanceRaf = 0
+    runMaintenance()
+  }
+
+  return encodeCurrentState()
 }
 
 /**
@@ -950,55 +1059,12 @@ function save() {
  */
 function restore(snapshot) {
   const data = decodeSnapshot(snapshot) // 非法快照在此抛错，当前状态不受影响
-
-  // 清挂起任务与指针，避免旧 rAF 在新状态上重放
-  if (rebuildRaf) {
-    cancelAnimationFrame(rebuildRaf)
-    rebuildRaf = 0
-  }
-  if (sampleTimer) {
-    clearTimeout(sampleTimer)
-    sampleTimer = 0
-  }
-  activePointers.clear()
-  clearHistoryState()
-
-  // 装填时间线
-  for (const item of data.strokes) {
-    const slot = {
-      id: nextSlotId++,
-      w: item.w,
-      pts: item.pts,
-      alive: item.alive,
-      block: -1,
-    }
-    slots.push(slot)
-    slotById.set(slot.id, slot)
-    if (slot.alive) undoStack.push(slot.id)
-  }
-  // 已固化前缀重新分块（分块边界只影响维护粒度，不影响像素）
-  const solidTo = Math.min(data.solidTo, slots.length)
-  const RESTORE_BLOCK = 128
-  for (let start = 0; start < solidTo; start += RESTORE_BLOCK) {
-    const ids = []
-    const end = Math.min(start + RESTORE_BLOCK, solidTo)
-    for (let i = start; i < end; i++) {
-      slots[i].block = blocks.length
-      ids.push(slots[i].id)
-    }
-    blocks.push(ids)
-  }
-  if (solidTo > 0) solidDirty = true // 下一帧从矢量重栅格化固化层
-  // redo 栈（快照里是槽位下标，映射回新 id）
-  for (const index of data.redo) {
-    const slot = slots[index]
-    if (slot && !slot.alive) redoStack.push(slot.id)
-  }
-  // 永久固化层位图（无矢量来源，只能以位图恢复）
-  if (data.perm) {
-    frozenBaseGrid = gridToCanvas(data.perm)
-    frozenDirty = true
-  }
+  // 公开 restore 保持 v3 语义「恢复到可视、可继续刮的在线状态」：
+  // 即便墙已把卡休眠，也先回到在线态再装载（wake 需要在清状态前做，
+  // 它内部只翻转标志，真正重建在下方 rebuildCanvas(true) 完成）。
+  sleeping = false
+  prepareForStateLoad()
+  loadTimelineFromSnapshot(data)
 
   cancelFade()
   const canvas = canvasRef.value
@@ -1027,6 +1093,252 @@ function restore(snapshot) {
   if (data.finished) emit('finish') // 让调用方同步完成态
 }
 
+/**
+ * v4 离屏恢复：把快照直接装填成「休眠态」（卡滚出视口时墙批量恢复
+ * 走这条路径）。与 restore 的区别：不碰 DOM 样式、不分配主 backing
+ * store、不 emit；永久层网格暂存到 frozenBaseGrid，留待 wake 的
+ * migrateMasks 消费；solid 层保持已释放，wake 时按当时尺寸/DPR
+ * 从矢量重栅格化。redo 栈语义与在线 restore 完全一致（快照自带）。
+ */
+function restoreOffline(snapshot) {
+  const data = decodeSnapshot(snapshot) // 非法快照先抛错，当前状态不受影响
+  prepareForStateLoad()
+  sleeping = true
+  loadTimelineFromSnapshot(data)
+  finished = !!data.finished
+  // 与在线 restore 同一完成态语义：进行中快照抑制「wake 复测立即
+  // finish」，否则覆盖率饱和的冷档卡一滚回视口就被自动完成、undo 被
+  // 禁用；用户真实刮擦（pointerdown）时解除。完成态快照无需抑制。
+  suppressFinish = !data.finished
+  lastProgress = data.progress
+  syncFlags()
+}
+
+/** restore / restoreOffline 共用：取消挂起任务、清旧状态（幂等安全） */
+function prepareForStateLoad() {
+  if (rebuildRaf) {
+    cancelAnimationFrame(rebuildRaf)
+    rebuildRaf = 0
+  }
+  if (sampleTimer) {
+    clearTimeout(sampleTimer)
+    sampleTimer = 0
+  }
+  activePointers.clear()
+  clearHistoryState()
+}
+
+/** restore / restoreOffline 共用：由解码数据装填时间线与永久层 */
+function loadTimelineFromSnapshot(data) {
+  for (const item of data.strokes) {
+    const slot = {
+      id: nextSlotId++,
+      w: item.w,
+      pts: item.pts,
+      alive: item.alive,
+      block: -1,
+    }
+    slots.push(slot)
+    slotById.set(slot.id, slot)
+    if (slot.alive) undoStack.push(slot.id)
+  }
+  // 已固化前缀重新分块（分块边界只影响维护粒度，不影响像素）
+  const solidTo = Math.min(data.solidTo, slots.length)
+  const RESTORE_BLOCK = 128
+  for (let start = 0; start < solidTo; start += RESTORE_BLOCK) {
+    const ids = []
+    const end = Math.min(start + RESTORE_BLOCK, solidTo)
+    for (let i = start; i < end; i++) {
+      slots[i].block = blocks.length
+      ids.push(slots[i].id)
+    }
+    blocks.push(ids)
+  }
+  if (solidTo > 0) solidDirty = true // wake/重建时从矢量重栅格化固化层
+  // redo 栈（快照里是槽位下标，映射回新 id）
+  for (const index of data.redo) {
+    const slot = slots[index]
+    if (slot && !slot.alive) redoStack.push(slot.id)
+  }
+  // 永久固化层位图（无矢量来源，只能以位图恢复）
+  if (data.perm) {
+    frozenBaseGrid = gridToCanvas(data.perm)
+    frozenDirty = true
+  }
+}
+
+/* ================= v4：休眠 / 唤醒 / 离屏序列化（墙支持） ================= */
+
+/** 释放一块 canvas 的 backing store（置 0 尺寸即归还 GPU/内存） */
+function releaseCanvas(canvas) {
+  if (!canvas) return
+  canvas.width = 0
+  canvas.height = 0
+}
+
+/**
+ * 休眠（滚出视口，幂等）。
+ *
+ * 交织场景①「多指刮擦中被滚走」：真实 pointerup 在滚走后可能再也
+ * 不来（指针被滚动取消），所以这里把每个进行中笔迹按「确认」处理：
+ * 推入 undoStack。不主动 releasePointerCapture——元素与监听仍在，
+ * 浏览器随后派发的 pointerup/cancel 走正常路径（幂等：Map 里已无此
+ * pointerId 直接 return），不阻塞休眠也不产生重复入栈。
+ *
+ * 顺序（重要）：先在主画布还活着时同步跑一轮维护（固化/丢弃，
+ * 丢弃会把最旧笔迹烘进 frozenMask——离屏也能做，但必须在释放主
+ * 画布前完成 repaint 一致性没有意义，因为我们要的是矢量/永久层
+ * 状态最新），再取消 rAF/定时器，最后释放主 backing store 与
+ * solidMask（可由矢量重建）。frozenMask 必须保留（无矢量来源）。
+ * 淡出定时器取消：finished 卡休眠期间无需动画计时，wake 直接落到
+ * visibility:hidden 终态（fade 已在休眠前完成或本就不需要）。
+ */
+function sleep() {
+  if (sleeping || !initialized) return
+
+  // 1) 进行中笔迹全部确认（不丢、不阻塞）
+  for (const active of activePointers.values()) {
+    undoStack.push(active.slot.id)
+  }
+  activePointers.clear()
+
+  // 2) 同步冲刷挂起维护（此时仍可正常分配/绘制离屏 frozen 层）
+  if (maintenanceRaf) {
+    cancelAnimationFrame(maintenanceRaf)
+    maintenanceRaf = 0
+  }
+  runMaintenance()
+
+  // 3) 取消所有挂起的帧/定时器
+  if (rebuildRaf) {
+    cancelAnimationFrame(rebuildRaf)
+    rebuildRaf = 0
+  }
+  if (sampleTimer) {
+    clearTimeout(sampleTimer)
+    sampleTimer = 0
+  }
+  if (fadeTimer) {
+    clearTimeout(fadeTimer)
+    fadeTimer = 0
+  }
+  pendingRepaint = false
+  pendingMeasure = false
+
+  // 4) 释放显示资源
+  releaseCanvas(canvasRef.value)
+  ctx = null
+  releaseCanvas(solidMask)
+  solidMask = null
+  solidCtx = null
+  sleeping = true
+}
+
+/**
+ * 唤醒（滚回视口，幂等）。一次同步 rebuildCanvas(true) 在本调用返回前
+ * 完成全部恢复（满足「1 帧内」）：主 backing store 按当前 DPR 重建、
+ * frozenMask 消费暂存网格或按新尺寸缩放、solidMask 从矢量重栅格化、
+ * 分层重放、进度复测。最坏情况是大批量矢量的 solid 重栅格化（同步，
+ * 墙卡片尺寸小 + maxHistory 有界，实测亚毫秒~数毫秒，见 README 验收）；
+ * 不为它做异步分帧——异步恢复的中间帧会出现空白涂层，违反 1 帧语义。
+ */
+function wake() {
+  if (!sleeping) return
+  sleeping = false
+  const canvas = canvasRef.value
+  if (finished) {
+    // 完成态：sleep 取消了淡出计时，这里直接落终态，避免重放一帧涂层
+    canvas.classList.add('scratch-canvas--instant')
+    canvas.classList.add('scratch-canvas--fading')
+    canvas.style.visibility = 'hidden'
+  }
+  rebuildCanvas(true) // 内部 migrateMasks 消费 frozenBaseGrid / 缩放旧位图
+  if (finished) {
+    void canvas.offsetHeight
+    requestAnimationFrame(() => canvas.classList.remove('scratch-canvas--instant'))
+  }
+}
+
+function isSleeping() {
+  return sleeping
+}
+
+/** v4：是否有任何需要保留的状态（空卡不进冷池，避免白占冷池预算） */
+function hasContent() {
+  return slots.length > 0 || frozenDirty || finished
+}
+
+/**
+ * 休眠卡的紧凑序列化（墙冷存档与 saveAll 共用；与在线 save 同格式，
+ * 只是绝不触碰已释放的主画布）。序列化前先同步跑一轮维护，使
+ * 「该丢进 frozenMask 的最旧笔迹」到位——这同时是交织场景③
+ * 「冷存档淘汰与 undo 跨固化边界同帧」的一致点：undo 只改矢量+
+ * solidDirty，evict 只搬永久层，JS 单线程顺序执行，这里取到的必是
+ * 两者都落地后的状态，序列化期间任何墙回调都无法插入。
+ */
+function serializeOffline() {
+  if (!initialized) throw new Error('[scratch] 组件尚未初始化，无法存档')
+  if (maintenanceRaf) {
+    cancelAnimationFrame(maintenanceRaf)
+    maintenanceRaf = 0
+  }
+  // runMaintenance 在 sleeping 下会空转，因此显式驱动维护步骤：
+  // 丢弃超 maxHistory 最旧笔迹（烘进永久层）。固化层重建在休眠期
+  // 无位图消费者（solidMask 已释放），跳过——快照本来就不存 solid。
+  if (sleeping) {
+    const limit = Math.max(1, Math.floor(props.maxHistory))
+    while (undoStack.length > limit) evictOldest()
+  } else {
+    runMaintenance()
+  }
+  return encodeCurrentState()
+}
+
+/** v4 离线重置（discarded 卡或 restore 未覆盖的卡槽用），不碰 DOM */
+function clearStateOffline() {
+  prepareForStateLoad()
+  sleeping = true
+  finished = false
+  suppressFinish = false
+  lastProgress = 0
+  frozenBaseGrid = null
+  syncFlags()
+}
+
+/**
+ * 离线状态内存计量（墙 wallMemoryBudget 的统一口径，见
+ * ScratchCardWall 文件头公式注释）：
+ *   vectors  矢量笔迹的保守上界估计（真实序列化通常远小于此，
+ *            墙用该上界做预算，宁紧勿松）
+ *   frozen   永久层 backing store 字节 = width*height*4
+ *   main     显示用主画布 + solidMask：仅在线卡 >0；休眠后必为 0
+ */
+function memoryStats() {
+  let points = 0
+  for (const slot of slots) points += slot.pts.length
+  // 每点两个归一化数：JS 里以 double 存储（16B），外加小数组与槽位
+  // 对象的固定开销（槽位 48B + 点数组头 32B 的均摊近似）
+  const vectors = points * 16 + slots.length * 80
+  const frozen = frozenMask ? frozenMask.width * frozenMask.height * 4 : 0
+  const main = sleeping
+    ? 0
+    : (canvasRef.value && canvasRef.value.width
+        ? canvasRef.value.width * canvasRef.value.height * 4
+        : 0) +
+      (solidMask ? solidMask.width * solidMask.height * 4 : 0)
+  return {
+    vectors,
+    frozen,
+    main,
+    offline: vectors + frozen, // 休眠卡实际驻留：主画布/solid 已释放
+    total: vectors + frozen + main,
+    strokes: slots.length,
+    points,
+    sleeping,
+    hasContent: slots.length > 0 || frozenDirty || finished,
+  }
+}
+
 /* ================= 调试：压测注入（仅调试开关下使用） ================= */
 
 /**
@@ -1036,7 +1348,7 @@ function restore(snapshot) {
  * 干扰 resize 计时观察）。
  */
 function seedStrokes(count) {
-  if (!initialized || finished) return
+  if (!initialized || finished || sleeping) return
   clearRedo()
   suppressFinish = true // 见变量注释：压测覆盖率必然越阈
   let s = 12345 // LCG，可复现
@@ -1107,6 +1419,12 @@ watch(
 )
 
 onMounted(() => {
+  if (props.initSleeping) {
+    // v4 墙路径：直接以休眠态启动。rebuildCanvas 的休眠分支只记录
+    // CSS 尺寸/DPR、不分配主 backing store；resize/DPR 监听照常挂载，
+    // 休眠期变化走离屏 frozen 迁移，wake 时一次重建到位。
+    sleeping = true
+  }
   rebuildCanvas(true)
   resizeObserver = new ResizeObserver(scheduleRebuild)
   resizeObserver.observe(rootRef.value)
@@ -1135,7 +1453,23 @@ defineExpose({
   restore,
   canUndo,
   canRedo,
-  __debug: { seed: seedStrokes, replayMs: () => lastReplayMs },
+  // ---- v4 新增（墙支持，均为纯新增，不改动 v3 语义）----
+  sleep,
+  wake,
+  isSleeping,
+  serializeOffline,
+  restoreOffline,
+  clearStateOffline,
+  memoryStats,
+  hasContent,
+  __debug: {
+    seed: seedStrokes,
+    replayMs: () => lastReplayMs,
+    // v4 墙调试：强制睡眠/唤醒（验收休眠恢复用）
+    sleep,
+    wake,
+    stats: () => memoryStats(),
+  },
 })
 </script>
 
